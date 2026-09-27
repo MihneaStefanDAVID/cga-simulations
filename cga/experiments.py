@@ -117,8 +117,9 @@ def _iter_results(
     counter = ctx.Value("i", 0)
     pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=init_worker,
                                initargs=(shared, counter))
-    # Largest n first, so the slowest runs do not all start at the end (results do not depend on order).
-    ordered = sorted(jobs, key=lambda job: -job[1].n)
+    # Jobs are submitted in their natural order (small n first), so finished results start arriving
+    # quickly and partial results are useful if the experiment is interrupted.
+    ordered = list(jobs)
     completed = False
     try:
         futures = {pool.submit(timed_run, spec): tag for tag, spec in ordered}

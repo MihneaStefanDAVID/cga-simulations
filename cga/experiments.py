@@ -1,4 +1,4 @@
-"""Experiment types: "trajectory" and "sweep".
+"""Experiment types: "trajectory", "sweep" (runtime vs K) and "scaling" (runtime vs n).
 
 The unit of work is ``run_instance(spec) -> RunResult``: one cGA run fully
 determined by an ``InstanceSpec`` (n, K, L, fitness, budget, seed). It has no
@@ -13,13 +13,14 @@ import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
 import yaml
 
 from . import plotting
+from .analysis import scaling_fits
 from .comparators import make_comparator
 from .expressions import eval_expr
 from .simulator import RunResult, run_cga
@@ -132,6 +133,57 @@ class TrajectoryConfig:
         )
 
 
+def geometric_ns(start: int, stop: int, factor: Optional[float] = None, count: Optional[int] = None) -> list[int]:
+    """Integers from start to stop, spaced geometrically by `factor` or as `count` points."""
+    if factor is not None:
+        vals, v = [], float(start)
+        while v <= stop * (1 + 1e-9):
+            vals.append(int(round(v)))
+            v *= factor
+    else:
+        vals = [int(round(v)) for v in np.geomspace(start, stop, count)]
+    return sorted(set(vals))
+
+
+def _parse_ns(entry: dict) -> list[int]:
+    """`n` as a number, a list, or a geometric range {from, to, factor} / {from, to, count}."""
+    name, raw = entry["name"], entry["n"]
+    if isinstance(raw, dict):
+        unknown = raw.keys() - {"from", "to", "factor", "count"}
+        if unknown or not {"from", "to"} <= raw.keys() or (("factor" in raw) == ("count" in raw)):
+            raise ValueError(f"experiment '{name}': n as a range needs 'from', 'to' and exactly one of "
+                             f"'factor' or 'count', e.g. {{from: 100, to: 3200, factor: 2}}")
+        start, stop = raw["from"], raw["to"]
+        if not (isinstance(start, int) and isinstance(stop, int) and 1 <= start <= stop):
+            raise ValueError(f"experiment '{name}': n range needs integers 1 <= from <= to")
+        if "factor" in raw and not float(raw["factor"]) > 1:
+            raise ValueError(f"experiment '{name}': n range factor must be > 1")
+        if "count" in raw and not (isinstance(raw["count"], int) and raw["count"] >= 2):
+            raise ValueError(f"experiment '{name}': n range count must be an integer >= 2")
+        return geometric_ns(start, stop, float(raw["factor"]) if "factor" in raw else None, raw.get("count"))
+    ns = raw if isinstance(raw, list) else [raw]
+    for n in ns:
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError(f"experiment '{name}': invalid n {n!r}")
+    if len(set(ns)) != len(ns):
+        raise ValueError(f"experiment '{name}': duplicate n values")
+    return list(ns)
+
+
+def _parse_K_exprs(entry: dict, ns: list[int]) -> list[str]:
+    raw = entry["K_values"]
+    K_exprs = [str(k) for k in (raw if isinstance(raw, list) else [raw])]
+    if not K_exprs:
+        raise ValueError(f"experiment '{entry['name']}': K_values is empty")
+    if len(set(K_exprs)) != len(K_exprs):
+        raise ValueError(f"experiment '{entry['name']}': duplicate entries in K_values")
+    for n in ns:  # fail early on bad expressions
+        for k in K_exprs:
+            if not eval_expr(k, n) > 0:
+                raise ValueError(f"experiment '{entry['name']}': K = {k} is not positive for n = {n}")
+    return K_exprs
+
+
 @dataclass(frozen=True)
 class SweepConfig:
     name: str
@@ -146,17 +198,8 @@ class SweepConfig:
     @staticmethod
     def from_entry(entry: dict) -> "SweepConfig":
         _check_keys(entry, _COMMON_REQUIRED | {"n", "K_values"}, _COMMON_OPTIONAL)
-        ns = entry["n"] if isinstance(entry["n"], list) else [entry["n"]]
-        for n in ns:
-            if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-                raise ValueError(f"experiment '{entry['name']}': invalid n {n!r}")
-        K_exprs = [str(k) for k in entry["K_values"]]
-        if len(set(K_exprs)) != len(K_exprs):
-            raise ValueError(f"experiment '{entry['name']}': duplicate entries in K_values")
-        for n in ns:  # fail early on bad expressions
-            for k in K_exprs:
-                if not eval_expr(k, n) > 0:
-                    raise ValueError(f"experiment '{entry['name']}': K = {k} is not positive for n = {n}")
+        ns = _parse_ns(entry)
+        K_exprs = _parse_K_exprs(entry, ns)
         return SweepConfig(
             name=entry["name"],
             ns=tuple(ns),
@@ -169,6 +212,51 @@ class SweepConfig:
         )
 
 
+@dataclass(frozen=True)
+class ScalingConfig:
+    """Runtime as a function of n, for K given as formulas in n (re-evaluated at every n)."""
+
+    name: str
+    ns: tuple[int, ...]
+    K_exprs: tuple[str, ...]
+    L: float
+    repetitions: int
+    max_iterations: int
+    seed: int
+    fitness: str = "binval"
+    normalize_by: Optional[str] = None  # f(n) for the extra plot T / f(n), e.g. "n*log(n)"
+
+    @staticmethod
+    def from_entry(entry: dict) -> "ScalingConfig":
+        _check_keys(entry, _COMMON_REQUIRED | {"n", "K_values"}, _COMMON_OPTIONAL | {"normalize_by"})
+        ns = _parse_ns(entry)
+        if len(ns) < 2:
+            raise ValueError(f"experiment '{entry['name']}': a scaling experiment needs at least 2 values of n "
+                             f"(better 4 or more)")
+        K_exprs = _parse_K_exprs(entry, ns)
+        norm = entry.get("normalize_by")
+        norm = str(norm).strip() if norm not in (None, "") else None
+        if norm is not None:
+            for n in ns:
+                if not eval_expr(norm, n) > 0:
+                    raise ValueError(f"experiment '{entry['name']}': normalize_by = {norm} is not positive "
+                                     f"for n = {n}")
+        return ScalingConfig(
+            name=entry["name"],
+            ns=tuple(sorted(ns)),
+            K_exprs=tuple(K_exprs),
+            L=float(entry["L"]),
+            repetitions=_positive_int(entry, "repetitions"),
+            max_iterations=_positive_int(entry, "max_iterations"),
+            seed=int(entry["seed"]),
+            fitness=entry.get("fitness", "binval"),
+            normalize_by=norm,
+        )
+
+
+GridConfig = Union[SweepConfig, ScalingConfig]  # both run every (n, K formula, repetition)
+
+
 def default_track_indices(n: int) -> list[int]:
     return [1, 2, 3, 5, 10, n // 4, n // 2, n]
 
@@ -179,7 +267,10 @@ def parse_experiment(entry: dict):
         return TrajectoryConfig.from_entry(entry)
     if kind == "sweep":
         return SweepConfig.from_entry(entry)
-    raise ValueError(f"experiment '{entry.get('name')}': unknown type {kind!r} (use 'trajectory' or 'sweep')")
+    if kind == "scaling":
+        return ScalingConfig.from_entry(entry)
+    raise ValueError(f"experiment '{entry.get('name')}': unknown type {kind!r} "
+                     f"(use 'trajectory', 'sweep' or 'scaling')")
 
 
 # --------------------------------------------------------------------------- #
@@ -304,7 +395,7 @@ def format_trajectory_summary(s: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Sweep experiments
+# Sweep and scaling experiments: a grid of (n, K formula, repetition) runs
 # --------------------------------------------------------------------------- #
 
 RAW_COLUMNS = [
@@ -326,7 +417,7 @@ class SweepTask:
         return (s.n, self.K_expr, s.L, s.fitness, s.max_iterations, s.seed, self.repetition)
 
 
-def sweep_tasks(cfg: SweepConfig) -> list[SweepTask]:
+def sweep_tasks(cfg: GridConfig) -> list[SweepTask]:
     tasks = []
     for n in cfg.ns:
         for k_expr in cfg.K_exprs:
@@ -350,14 +441,15 @@ def _row_key(row) -> tuple:
     )
 
 
-def run_sweep(
-    cfg: SweepConfig,
+def _run_grid(
+    cfg: GridConfig,
     out_dir: Path,
-    fresh: bool = False,
-    plot_only: bool = False,
-    log: LogFn = print,
-    progress: ProgressFn = _no_progress,
-) -> None:
+    fresh: bool,
+    plot_only: bool,
+    log: LogFn,
+    progress: ProgressFn,
+) -> pd.DataFrame:
+    """Run (or resume) every instance of the grid; write raw_results.csv and summary.csv."""
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_path = out_dir / "raw_results.csv"
     if fresh and raw_path.exists() and not plot_only:
@@ -401,10 +493,42 @@ def run_sweep(
     summary = sweep_summary(cfg, raw)
     summary.to_csv(out_dir / "summary.csv", index=False)
     log(summary.to_string(index=False))
+    return summary
+
+
+def run_sweep(
+    cfg: SweepConfig,
+    out_dir: Path,
+    fresh: bool = False,
+    plot_only: bool = False,
+    log: LogFn = print,
+    progress: ProgressFn = _no_progress,
+) -> None:
+    summary = _run_grid(cfg, out_dir, fresh, plot_only, log, progress)
     plotting.plot_sweep(cfg, summary, out_dir)
 
 
-def sweep_summary(cfg: SweepConfig, raw: pd.DataFrame) -> pd.DataFrame:
+def run_scaling(
+    cfg: ScalingConfig,
+    out_dir: Path,
+    fresh: bool = False,
+    plot_only: bool = False,
+    log: LogFn = print,
+    progress: ProgressFn = _no_progress,
+) -> None:
+    summary = _run_grid(cfg, out_dir, fresh, plot_only, log, progress)
+    fits = scaling_fits(summary, cfg.K_exprs)
+    fits.to_csv(out_dir / "scaling_fits.csv", index=False)
+    for f in fits.itertuples(index=False):
+        if np.isfinite(f.exponent_b):
+            log(f"  K = {f.K_expr}: T ~ {f.prefactor:.3g} * n^{f.exponent_b:.3f}  "
+                f"(R^2 = {f.r_squared:.3f}, {f.n_points_used}/{f.n_points_total} n values used)")
+        else:
+            log(f"  K = {f.K_expr}: no fit (fewer than 2 n values where more than half of the runs finished)")
+    plotting.plot_scaling(cfg, summary, fits, out_dir)
+
+
+def sweep_summary(cfg: GridConfig, raw: pd.DataFrame) -> pd.DataFrame:
     """Per (n, K): success rate and runtime statistics.
 
     runtime_* columns use successful runs only. median_censored is the median
@@ -464,7 +588,7 @@ def run_experiment(
     cfg = parse_experiment(entry)
     out_dir = results_root / cfg.name
     log(f"=== {cfg.name} ({entry['type']}) -> {out_dir}")
-    runner = run_trajectory if isinstance(cfg, TrajectoryConfig) else run_sweep
+    runner = {TrajectoryConfig: run_trajectory, SweepConfig: run_sweep, ScalingConfig: run_scaling}[type(cfg)]
     runner(cfg, out_dir, fresh=fresh, plot_only=plot_only, log=log, progress=progress)
     # The exact entry (including any description), so results can be traced back and rerun.
     (out_dir / "experiment.yaml").write_text(

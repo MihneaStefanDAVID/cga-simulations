@@ -10,8 +10,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from cga.analysis import fit_power_law, scaling_fits  # noqa: E402
 from cga.comparators import binval_comparator  # noqa: E402
-from cga.experiments import InstanceSpec, run_instance  # noqa: E402
+from cga.experiments import InstanceSpec, geometric_ns, parse_experiment, run_experiment, run_instance  # noqa: E402
 from cga.expressions import eval_expr  # noqa: E402
 from cga.simulator import borders, run_cga  # noqa: E402
 
@@ -114,6 +115,59 @@ def test_eval_expr():
     assert abs(eval_expr("5 * log(n)", 100) - 5 * np.log(100)) < 1e-12
     assert eval_expr(50, 100) == 50.0
     assert eval_expr("0.3*n", 10) == 3.0
+
+
+def test_geometric_ns():
+    assert geometric_ns(100, 3200, factor=2) == [100, 200, 400, 800, 1600, 3200]
+    assert geometric_ns(100, 1000, factor=2) == [100, 200, 400, 800]
+    assert geometric_ns(10, 1000, count=3) == [10, 100, 1000]
+
+
+def test_fit_power_law_recovers_exponent():
+    n = np.array([100, 200, 400, 800, 1600], dtype=float)
+    b, a, r2 = fit_power_law(n, 3.0 * n ** 1.5)
+    assert abs(b - 1.5) < 1e-9 and abs(np.exp(a) - 3.0) < 1e-6 and abs(r2 - 1) < 1e-12
+    assert fit_power_law(n[:1], n[:1]) is None
+
+
+def test_scaling_fit_uses_only_uncensored_points():
+    import pandas as pd
+    n = [100, 200, 400, 800]
+    summary = pd.DataFrame({
+        "n": n, "K_expr": ["k"] * 4,
+        "median_censored": [1e3, 4e3, 1.6e4, np.nan],  # T ~ n^2 where > half finished
+        "runtime_median": [1e3, 4e3, 1.6e4, 5e3],      # biased point at n = 800 must be ignored
+    })
+    fit = scaling_fits(summary, ["k"]).iloc[0]
+    assert abs(fit.exponent_b - 2.0) < 1e-9 and fit.n_points_used == 3 and fit.n_max_used == 400
+
+
+def _scaling_entry(**over):
+    e = {"name": "s", "type": "scaling", "n": {"from": 10, "to": 40, "factor": 2}, "K_values": ["2*log(n)"],
+         "L": 2.0, "repetitions": 3, "max_iterations": 50_000, "seed": 1, "normalize_by": "n*log(n)"}
+    e.update(over)
+    return e
+
+
+def test_scaling_config_validation():
+    cfg = parse_experiment(_scaling_entry())
+    assert cfg.ns == (10, 20, 40) and cfg.K_exprs == ("2*log(n)",) and cfg.normalize_by == "n*log(n)"
+    for bad in [{"n": [50]}, {"n": {"from": 10, "to": 40}}, {"n": {"from": 10, "to": 40, "factor": 1}},
+                {"normalize_by": "n - 100"}, {"K_values": []}]:
+        try:
+            parse_experiment(_scaling_entry(**bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted invalid scaling config {bad}")
+
+
+def test_scaling_pipeline(tmp_path=None):
+    import tempfile
+    root = Path(tmp_path or tempfile.mkdtemp())
+    out = run_experiment(_scaling_entry(), root, log=lambda _m: None)
+    for f in ["raw_results.csv", "summary.csv", "scaling_fits.csv", "runtime_vs_n.png",
+              "runtime_normalized.png", "experiment.yaml"]:
+        assert (out / f).exists(), f
 
 
 if __name__ == "__main__":

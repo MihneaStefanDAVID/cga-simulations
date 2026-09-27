@@ -61,3 +61,23 @@ experiments:
     repetitions: 10
     max_iterations: 200000
     seed: 42                     # repetition r uses seed + r (for every n and every K)
+
+  # --------------------------------------------------------------------------
+  # TYPE "scaling": runtime as a function of n, with K as a formula in n.
+  # Each K formula is re-evaluated at every n. Output: log-log runtime-vs-n plot
+  # with a fitted power law T ~ c * n^b per formula, an optional normalized plot
+  # T / f(n), scaling_fits.csv, raw_results.csv and summary.csv.
+  # The fit only uses n values where more than half of the runs finished.
+  # --------------------------------------------------------------------------
+  - name: my_scaling
+    description: "How does the runtime grow with n for K = 5 ln n?"   # optional
+    type: scaling
+    fitness: binval
+    n: {from: 50, to: 800, factor: 2}   # geometric range: 50, 100, 200, 400, 800
+                                        # or {from: 50, to: 800, count: 6}, or a list [50, 100, 200]
+    K_values: ["5*log(n)", "sqrt(n)*log(n)"]   # one line in the plot per formula
+    L: 1.0
+    repetitions: 10
+    max_iterations: 1000000      # must suffice for the largest n
+    seed: 42
+    normalize_by: "n*log(n)"     # optional: extra plot of T / f(n); flat = grows like f(n)

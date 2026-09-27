@@ -34,6 +34,11 @@ EXAMPLES = [
         "K_values": ["2*log(n)", "5*log(n)", "10*log(n)", "sqrt(n*log(n))", "0.3*n", "n"],
         "L": 2.0, "repetitions": 10, "max_iterations": 30_000, "seed": 1,
     },
+    {
+        "name": "readme_scaling", "type": "scaling", "n": {"from": 50, "to": 800, "factor": 2},
+        "K_values": ["4*log(n)", "8*log(n)", "sqrt(n)*log(n)"], "L": 2.0, "repetitions": 10,
+        "max_iterations": 300_000, "seed": 1, "normalize_by": "n*log(n)",
+    },
 ]
 
 
@@ -108,6 +113,8 @@ def main() -> None:
         BUILD / "readme_trajectory" / "heatmap.png": "example_heatmap.png",
         BUILD / "readme_trajectory" / "trajectories.png": "example_trajectories.png",
         BUILD / "readme_sweep" / "runtime_vs_K_n100.png": "example_sweep.png",
+        BUILD / "readme_scaling" / "runtime_vs_n.png": "example_scaling.png",
+        BUILD / "readme_scaling" / "runtime_normalized.png": "example_scaling_normalized.png",
     }
     for src, dst in copies.items():
         shutil.copy(src, IMAGES / dst)

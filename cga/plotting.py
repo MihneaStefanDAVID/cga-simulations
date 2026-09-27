@@ -12,12 +12,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 
+from .analysis import scaling_fits
 from .simulator import borders
 
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .experiments import SweepConfig, TrajectoryConfig
+    from .experiments import GridConfig, ScalingConfig, SweepConfig, TrajectoryConfig
 
 # Fixed categorical order (never cycled); slot i always means the same series.
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
@@ -155,6 +156,8 @@ def _stagger(K: np.ndarray, ratio: float = 1.3) -> np.ndarray:
 def plot_sweep(cfg: "SweepConfig", summary: "pd.DataFrame", out_dir: Path) -> None:
     for n in cfg.ns:
         _plot_sweep_n(cfg, summary[summary["n"] == n].sort_values("K"), n, out_dir)
+    if len(cfg.ns) >= 2:
+        plot_runtime_vs_n(cfg, summary, scaling_fits(summary, cfg.K_exprs), out_dir / "runtime_vs_n")
 
 
 def _plot_sweep_n(cfg: "SweepConfig", s: "pd.DataFrame", n: int, out_dir: Path) -> None:
@@ -208,3 +211,135 @@ def _plot_sweep_n(cfg: "SweepConfig", s: "pd.DataFrame", n: int, out_dir: Path) 
     ax.minorticks_off()
     ax.set_yscale("log")  # restore log minor ticks on y after minorticks_off
     _save(fig, out_dir / f"runtime_vs_K_n{n}")
+
+
+# --------------------------------------------------------------------------- #
+# Runtime vs n (scaling experiments, and sweeps with >= 2 values of n)
+# --------------------------------------------------------------------------- #
+
+
+def plot_scaling(cfg: "ScalingConfig", summary: "pd.DataFrame", fits: "pd.DataFrame", out_dir: Path) -> None:
+    plot_runtime_vs_n(cfg, summary, fits, out_dir / "runtime_vs_n")
+    if cfg.normalize_by:
+        _plot_normalized(cfg, summary, out_dir / "runtime_normalized")
+
+
+def _series(summary: "pd.DataFrame", k_expr: str):
+    """Per K formula: n, the budget-unbiased median (NaN where <= half finished), and the fallback."""
+    s = summary[summary["K_expr"] == k_expr].sort_values("n")
+    n = s["n"].to_numpy(float)
+    full = s["median_censored"].to_numpy(float)  # defined where > half of the runs finished
+    partial = np.where(np.isfinite(full), np.nan, s["runtime_median"].to_numpy(float))  # biased low
+    return s, n, full, partial
+
+
+def _marker_legend(ax, any_partial: bool) -> list:
+    from matplotlib.lines import Line2D
+
+    handles = [Line2D([], [], color=REFERENCE, marker="o", ls="", ms=6,
+                      label="median of all runs (> half finished): fitted")]
+    if any_partial:
+        handles.append(Line2D([], [], color=REFERENCE, marker="o", ls="", ms=6, mfc="white",
+                              label="median of finished runs only (≤ half finished):\nbiased low, not fitted"))
+    return handles
+
+
+def plot_runtime_vs_n(cfg: "GridConfig", summary: "pd.DataFrame", fits: "pd.DataFrame", path_stem: Path) -> None:
+    """Median runtime vs n per K formula (log-log), with the fitted power law T ~ c * n^b."""
+    fig, (ax, ax_s) = plt.subplots(
+        2, 1, sharex=True, figsize=(8.5, 6.5), gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08}
+    )
+    ns = np.array(sorted(cfg.ns), dtype=float)
+    ax.axhline(cfg.max_iterations, color=REFERENCE, lw=0.9, ls=":", zorder=1)
+    ax.annotate("budget", (1, cfg.max_iterations), xycoords=("axes fraction", "data"),
+                xytext=(-2, 3), textcoords="offset points", ha="right", va="bottom",
+                fontsize=8.5, color=TEXT_MUTED)
+
+    any_point = any_partial = False
+    for j, k_expr in enumerate(cfg.K_exprs):
+        color = SERIES[j % len(SERIES)]
+        s, n, full, partial = _series(summary, k_expr)
+        fit = fits[fits["K_expr"] == k_expr].iloc[0]
+        if np.isfinite(fit.exponent_b):
+            quality = (f"R² = {fit.r_squared:.3f}" if fit.n_points_used > 2
+                       else "only 2 points: exact by construction")
+            label = (f"K = {k_expr}:  T ≈ {fit.prefactor:.3g}·n^{fit.exponent_b:.2f}\n"
+                     f"    {quality}, {fit.n_points_used} of {fit.n_points_total} n values")
+            x = np.geomspace(fit.n_min_used, fit.n_max_used, 50)
+            ax.plot(x, fit.prefactor * x ** fit.exponent_b, color=color, lw=1.0, ls="--", alpha=0.7, zorder=2)
+        else:
+            label = f"K = {k_expr}:  no fit (< 2 n values with > half finished)"
+        band = np.isfinite(s["runtime_p10"].to_numpy(float))
+        if band.any():
+            ax.fill_between(n[band], s["runtime_p10"][band], s["runtime_p90"][band], color=color, alpha=0.10,
+                            lw=0, zorder=1)
+        ok = np.isfinite(full)
+        ax.plot(n[ok], full[ok], color=color, lw=1.8, marker="o", ms=6, label=label, zorder=3)
+        hollow = np.isfinite(partial)
+        if hollow.any():
+            ax.plot(n[hollow], partial[hollow], color=color, lw=0, marker="o", ms=6, mfc="white", mew=1.5,
+                    zorder=3)
+        any_point |= ok.any() or hollow.any()
+        any_partial |= hollow.any()
+        ax_s.plot(n, s["success_rate"].to_numpy(float), color=color, lw=1.5, marker="o", ms=5)
+
+    if not any_point:
+        ax.text(0.5, 0.5, "no repetition reached the optimum within the budget",
+                transform=ax.transAxes, ha="center", color=TEXT_MUTED)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(True, which="major")
+    ax.set_ylabel("runtime T (iterations)")
+    ax.set_title(f"{cfg.name}: runtime vs n on {cfg.fitness}, L = {cfg.L:g}, {cfg.repetitions} runs per point, "
+                 f"budget {cfg.max_iterations:,}\ndashed = fitted power law; band = 10th–90th percentile of "
+                 "finished runs", fontsize=10)
+    leg = ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8.5, title="K (formula in n)")
+    ax.add_artist(leg)
+    ax.legend(handles=_marker_legend(ax, any_partial), loc="lower left", bbox_to_anchor=(1.01, 0.0),
+              fontsize=8)
+
+    ax_s.set_ylim(-0.05, 1.05)
+    ax_s.set_yticks([0, 0.5, 1])
+    ax_s.axhline(0.5, color=REFERENCE, lw=0.8, ls=":")
+    ax_s.grid(True, which="major")
+    ax_s.set_ylabel("P(success)")
+    ax_s.set_xlabel("n (log scale)")
+    ax_s.set_xticks(ns)
+    ax_s.set_xticklabels([f"{int(v)}" for v in ns], rotation=45 if len(ns) > 8 else 0)
+    ax_s.minorticks_off()
+    ax.minorticks_off()
+    ax.set_yscale("log")  # restore log minor ticks on y after minorticks_off
+    _save(fig, path_stem)
+
+
+def _plot_normalized(cfg: "ScalingConfig", summary: "pd.DataFrame", path_stem: Path) -> None:
+    """T / f(n) vs n: flat means T grows like f(n), rising means faster, falling means slower."""
+    from .expressions import eval_expr
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.8))
+    any_partial = False
+    for j, k_expr in enumerate(cfg.K_exprs):
+        color = SERIES[j % len(SERIES)]
+        _, n, full, partial = _series(summary, k_expr)
+        f = np.array([eval_expr(cfg.normalize_by, int(v)) for v in n])
+        ok, hollow = np.isfinite(full), np.isfinite(partial)
+        ax.plot(n[ok], full[ok] / f[ok], color=color, lw=1.8, marker="o", ms=6, label=f"K = {k_expr}")
+        if hollow.any():
+            ax.plot(n[hollow], partial[hollow] / f[hollow], color=color, lw=0, marker="o", ms=6, mfc="white",
+                    mew=1.5)
+            any_partial = True
+    ax.set_xscale("log")
+    ax.set_ylim(bottom=0)
+    ax.grid(True, which="major")
+    ns = np.array(sorted(cfg.ns), dtype=float)
+    ax.set_xticks(ns)
+    ax.set_xticklabels([f"{int(v)}" for v in ns], rotation=45 if len(ns) > 8 else 0)
+    ax.minorticks_off()
+    ax.set_xlabel("n (log scale)")
+    ax.set_ylabel(f"T / ({cfg.normalize_by})")
+    ax.set_title(f"{cfg.name}: median runtime divided by {cfg.normalize_by}\n"
+                 "flat = grows like it · rising = grows faster · falling = grows slower", fontsize=10)
+    leg = ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8.5, title="K (formula in n)")
+    ax.add_artist(leg)
+    ax.legend(handles=_marker_legend(ax, any_partial), loc="lower left", bbox_to_anchor=(1.01, 0.0), fontsize=8)
+    _save(fig, path_stem)

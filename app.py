@@ -22,7 +22,8 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-from cga.experiments import SweepConfig, TrajectoryConfig, default_track_indices, parse_experiment, run_experiment
+from cga.experiments import (ScalingConfig, SweepConfig, TrajectoryConfig, default_track_indices, geometric_ns,
+                             parse_experiment, run_experiment)
 from cga.expressions import eval_expr
 from cga.simulator import borders
 
@@ -61,6 +62,19 @@ DEFAULTS = {
     "sw_maxit": 200_000,
     "sw_seed": 42,
     "sw_fitness": "binval",
+    "sc_nmode": "Geometric range",
+    "sc_from": 50,
+    "sc_to": 800,
+    "sc_factor": 2.0,
+    "sc_nlist": "50, 100, 200, 400, 800",
+    "sc_Ks": "5*log(n)",
+    "sc_L": 1.0,
+    "sc_reps": 10,
+    "sc_maxit": 1_000_000,
+    "sc_seed": 42,
+    "sc_fitness": "binval",
+    "sc_norm": "n*log(n)",
+    "sc_export_name": "my_scaling",
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
@@ -121,7 +135,7 @@ def validate(entry: dict):
     try:
         return parse_experiment(entry), None
     except Exception as exc:  # show config problems in the UI instead of crashing
-        return None, str(exc)
+        return None, str(exc).replace(f"experiment '{DRAFT_NAME}': ", "")
 
 
 def run_with_ui(entry: dict, results_root: Path, label: str) -> Path | None:
@@ -275,7 +289,9 @@ def show_results(out_dir: Path) -> None:
         except ValueError:
             shown = out_dir
         st.caption(f"Files are in `{shown}/` (inside the project folder)")
-    if (out_dir / "raw_results.csv").exists():
+    if (out_dir / "scaling_fits.csv").exists():
+        _show_scaling_results(out_dir)
+    elif (out_dir / "raw_results.csv").exists():
         _show_sweep_results(out_dir)
     elif (out_dir / "summary.json").exists():
         _show_trajectory_results(out_dir)
@@ -322,13 +338,49 @@ def _show_sweep_results(out_dir: Path) -> None:
                 "of runs the statistics are based on. Bottom: fraction of runs that sampled the optimum within "
                 "the budget. Both axes of the top plot are logarithmic.")
     plots = sorted(out_dir.glob("runtime_vs_K_n*.png"), key=lambda p: int(p.stem.split("_n")[-1]))
-    for tab, path in zip(st.tabs([f"n = {p.stem.split('_n')[-1]}" for p in plots]), plots):
+    labels = [f"n = {p.stem.split('_n')[-1]}" for p in plots]
+    if (out_dir / "runtime_vs_n.png").exists():  # sweeps with >= 2 values of n
+        plots.append(out_dir / "runtime_vs_n.png")
+        labels.append("runtime vs n")
+    for tab, path in zip(st.tabs(labels), plots):
         with tab:
             _image(path, max_width=900)
     st.markdown("**Summary table** (runtime columns: successful runs only; `median_censored`: median over all runs "
                 "with failures counted as ∞, defined only when more than half succeeded)")
     st.dataframe(summary, hide_index=True)
     _downloads(out_dir, ["raw_results.csv", "summary.csv"] + [p.with_suffix(".pdf").name for p in plots])
+
+
+def _show_scaling_results(out_dir: Path) -> None:
+    fits = pd.read_csv(out_dir / "scaling_fits.csv")
+    summary = pd.read_csv(out_dir / "summary.csv")
+    st.markdown("**Fitted power laws** T ≈ c · n^b, one per K formula. The fit uses the median over *all* runs, "
+                "and only at the n values where more than half of the runs finished within the budget. Elsewhere "
+                "the median is biased by the budget, so those points are shown hollow and left out.")
+    table = pd.DataFrame({
+        "K formula": fits["K_expr"],
+        "exponent b": fits["exponent_b"].round(3),
+        "prefactor c": fits["prefactor"].map(lambda v: f"{v:.3g}" if pd.notna(v) else "—"),
+        "R²": fits["r_squared"].round(4),
+        "n values used": [f"{u} of {t}" for u, t in zip(fits["n_points_used"], fits["n_points_total"])],
+        "n range used": [f"{int(a)}–{int(b)}" if pd.notna(a) else "—"
+                         for a, b in zip(fits["n_min_used"], fits["n_max_used"])],
+    })
+    st.dataframe(table, hide_index=True)
+    if (fits["n_points_used"] <= 2).any():
+        st.warning("Some fits use 2 or fewer n values. A line through 2 points always fits perfectly, so their "
+                   "exponent says little. Use more n values, or a larger budget so that more runs finish.")
+    st.markdown("**Runtime vs n** (log-log). Straight line = polynomial growth, and the slope is the exponent. "
+                "Bottom: fraction of runs that finished within the budget.")
+    _image(out_dir / "runtime_vs_n.png", max_width=1000)
+    if (out_dir / "runtime_normalized.png").exists():
+        st.markdown("**Normalized runtime** T / f(n). If the curve is flat, T grows like f(n). If it rises, T grows "
+                    "faster; if it falls, slower. This is often easier to judge than a slope.")
+        _image(out_dir / "runtime_normalized.png", max_width=1000)
+    st.markdown("**Summary table** (per n and K formula)")
+    st.dataframe(summary, hide_index=True)
+    _downloads(out_dir, ["scaling_fits.csv", "summary.csv", "raw_results.csv", "runtime_vs_n.pdf",
+                         "runtime_normalized.pdf"])
 
 
 def _image(path: Path, max_width: int | None = None) -> None:
@@ -400,6 +452,7 @@ def page_about() -> None:
         "Choose a mode in the sidebar:\n\n"
         "- **Trajectory** — one setting (n, K, L), watched over time: how do the frequencies evolve?\n"
         "- **Sweep** — runtime as a function of K, for one or more n.\n"
+        "- **Scaling** — runtime as a function of n, with K given as a formula in n; fits T ≈ c·nᵇ.\n"
         "- **Load from file** — upload an experiment file (YAML) with any number of experiments and run them.\n"
         "- **Browse results** — reopen the plots and tables of any experiment run before (from here or the terminal)."
     )
@@ -600,12 +653,120 @@ def page_sweep() -> None:
         show_run(ss.sw_run)
 
 
+def page_scaling() -> None:
+    st.title("Scaling — runtime as a function of n")
+    st.markdown(
+        "**What happens:** for each **K formula** (for example `5*log(n)`), the formula is evaluated again at every "
+        "value of n, and the cGA runs **repetitions** times for each n. The main plot shows the median runtime "
+        "against n on a **log-log** scale. On such a plot, polynomial growth T ≈ c·nᵇ is a straight line with slope "
+        "b, and the app fits b for every formula. An optional second plot divides T by a reference f(n), such as "
+        "n·log(n); a flat curve then means T grows like f(n)."
+    )
+    st.info("**How the fit avoids the budget bias.** At an n where some runs hit the budget, the median over the "
+            "finished runs alone is too small. The fit therefore uses the median over *all* runs, which is exact "
+            "whenever more than half finished, and it leaves out the n values where that is not the case "
+            "(drawn as hollow points).")
+    glossary()
+
+    st.subheader("Parameters")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.radio("n values", ["Geometric range", "List"], key="sc_nmode", horizontal=True,
+                 help="A geometric range (each n a fixed factor larger) spaces the points evenly on the log axis.")
+        if st.session_state.sc_nmode == "Geometric range":
+            a, b, c = st.columns(3)
+            a.number_input("from", key="sc_from", min_value=1, step=10)
+            b.number_input("to", key="sc_to", min_value=1, step=100)
+            c.number_input("factor", key="sc_factor", min_value=1.01, step=0.5, format="%.2f",
+                           help="2 doubles n each step: 50, 100, 200, …")
+        else:
+            st.text_input("n values (comma-separated)", key="sc_nlist")
+        st.number_input("L — border factor", key="sc_L", min_value=0.01, step=0.05, format="%.3f",
+                        help="Borders l = 1/(L·n), u = 1 − l. L = 1: standard borders.")
+    with c2:
+        st.text_area("K formulas (one per line, expression in n)", key="sc_Ks", height=120,
+                     help="Each formula is one line in the plot. log is the natural log. A plain number keeps K "
+                          "fixed for all n.")
+        st.text_input("Normalize by f(n) (optional)", key="sc_norm",
+                      help="Adds a plot of T / f(n). Leave empty to skip. Examples: n*log(n), n**1.5, n**2.")
+    with c3:
+        st.number_input("Repetitions per (n, K)", key="sc_reps", min_value=1, step=1)
+        st.number_input("max_iterations — budget per run", key="sc_maxit", min_value=1, step=100_000,
+                        help="Must be large enough for the largest n; otherwise those points drop out of the fit.")
+        st.number_input("Seed", key="sc_seed", step=1, help="Repetition r uses seed + r, for every n and K.")
+        st.selectbox("Fitness function", IMPLEMENTED_FITNESS, key="sc_fitness")
+
+    ss = st.session_state
+    error = None
+    if ss.sc_nmode == "Geometric range":
+        n_field = {"from": int(ss.sc_from), "to": int(ss.sc_to), "factor": float(ss.sc_factor)}
+        if ss.sc_to < ss.sc_from:
+            error = "'to' must be at least 'from'."
+    else:
+        try:
+            n_field = _parse_ns(ss.sc_nlist)
+        except ValueError:
+            n_field, error = [], "n values must be whole numbers separated by commas."
+    K_exprs = [line.strip() for line in ss.sc_Ks.splitlines() if line.strip()]
+    entry = {"name": DRAFT_NAME, "type": "scaling", "fitness": ss.sc_fitness, "n": n_field, "K_values": K_exprs,
+             "L": float(ss.sc_L), "repetitions": int(ss.sc_reps), "max_iterations": int(ss.sc_maxit),
+             "seed": int(ss.sc_seed)}
+    if ss.sc_norm.strip():
+        entry["normalize_by"] = ss.sc_norm.strip()
+    cfg = None
+    if not error:
+        if not K_exprs:
+            error = "Enter at least one K formula."
+        else:
+            cfg, error = validate(entry)
+
+    st.subheader("Resulting values")
+    if error:
+        st.error(error)
+    else:
+        st.markdown(f"**n values ({len(cfg.ns)}):** {', '.join(map(str, cfg.ns))}")
+        rows = []
+        for n in cfg.ns:
+            row = {"n": n}
+            for k in cfg.K_exprs:
+                row[f"K = {k}"] = round(eval_expr(k, n), 3)
+            if cfg.normalize_by:
+                row[f"f(n) = {cfg.normalize_by}"] = round(eval_expr(cfg.normalize_by, n), 1)
+            row["borders l / u"] = f"{borders(n, cfg.L)[0]:.3g} / {borders(n, cfg.L)[1]:.4g}"
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        m = st.columns(3)
+        m[0].metric("Runs in total", f"{len(cfg.ns) * len(cfg.K_exprs) * cfg.repetitions:,}",
+                    help="n values × K formulas × repetitions")
+        m[1].metric("Budget per run", f"{cfg.max_iterations:,}")
+        m[2].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg)),
+                    help="Rough estimate if every run uses its full budget. Dominated by the largest n.")
+        if len(cfg.ns) < 4:
+            st.warning(f"Only {len(cfg.ns)} values of n. Exponents fitted from so few points are unreliable (two "
+                       "points always fit perfectly). Four or more, spread over at least a factor of 8 in n, "
+                       "is better.")
+        config_actions(_core(entry), "sc")
+
+    st.subheader("Run")
+    st.caption("Results are not saved automatically: after the run you can save them under a name and description. "
+               "Changing any input while a run is going stops it; running the same settings again continues "
+               "where it stopped.")
+    if st.button("▶ Run scaling experiment", type="primary", disabled=bool(error)):
+        run = run_draft(_core(entry), "scaling experiment")
+        if run:
+            ss.sc_run = run
+    if ss.get("sc_run"):
+        st.subheader("Results")
+        show_run(ss.sc_run)
+
+
 def _describe(cfg) -> dict:
     if isinstance(cfg, TrajectoryConfig):
         return {"name": cfg.name, "type": "trajectory", "n": str(cfg.n), "K": f"{cfg.K_expr} (= {cfg.K:.4g})",
                 "L": cfg.L, "repetitions": cfg.repetitions, "max_iterations": f"{cfg.max_iterations:,}",
                 "seed": cfg.seed, "runs": cfg.repetitions, "worst-case time": fmt_duration(worst_case_seconds(cfg))}
-    return {"name": cfg.name, "type": "sweep", "n": ", ".join(map(str, cfg.ns)), "K": ", ".join(cfg.K_exprs),
+    kind = "scaling" if isinstance(cfg, ScalingConfig) else "sweep"
+    return {"name": cfg.name, "type": kind, "n": ", ".join(map(str, cfg.ns)), "K": ", ".join(cfg.K_exprs),
             "L": cfg.L, "repetitions": cfg.repetitions, "max_iterations": f"{cfg.max_iterations:,}",
             "seed": cfg.seed, "runs": len(cfg.ns) * len(cfg.K_exprs) * cfg.repetitions,
             "worst-case time": fmt_duration(worst_case_seconds(cfg))}
@@ -718,6 +879,7 @@ PAGES = {
     "About the algorithm": (page_about, "what the cGA does, all symbols"),
     "Trajectory": (page_trajectory, "one (n, K, L), frequencies over time"),
     "Sweep": (page_sweep, "runtime vs K, for one or more n"),
+    "Scaling": (page_scaling, "runtime vs n, K as a formula in n"),
     "Load from file": (page_load, "upload a YAML experiment file"),
     "Browse results": (page_browse, "reopen saved experiments"),
 }

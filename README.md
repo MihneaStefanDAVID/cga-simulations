@@ -79,7 +79,7 @@ recorded as *not converged*.
 
 ## What the simulator measures
 
-There are two experiment types. Both are described in a YAML file or in the app.
+There are three experiment types. Each can be set up in a YAML file or in the app.
 
 ### 1. Trajectory: one setting, followed over time
 
@@ -97,7 +97,7 @@ summary and two plots:
 ### 2. Sweep: runtime as a function of K
 
 For every combination of $n$ and $K$, the cGA runs a number of independent times and records only
-the runtime. Runtimes are heavy-tailed, and runs can hit the budget, so the plot shows
+the runtime. Runtimes are heavy-tailed, and runs can hit the budget, so the plots show
 **median and 10th–90th percentile** instead of mean ± standard deviation, together with the
 **success rate** within the budget:
 
@@ -113,6 +113,31 @@ single run are saved as CSV, so plots can be redone without re-simulating.
 *Illustrative example: n = 100, L = 2, 10 repetitions per K, budget 30 000 iterations. The parameter
 values in these examples are only for demonstration.*
 
+A sweep with two or more values of $n$ also produces the runtime-vs-n figure described in the next
+section. For a proper study of the growth in $n$, the scaling type is the better fit.
+
+### 3. Scaling: runtime as a function of n
+
+Each $K$ is given as a formula in $n$, for example `5*log(n)`, and is re-evaluated at every $n$. The
+$n$ values are usually a geometric range such as 50, 100, 200, 400, 800. The main plot shows the
+median runtime against $n$ on a **log-log** scale, where polynomial growth $T \approx c\,n^{b}$ is
+a straight line with slope $b$. The simulator fits $b$ by least squares for each formula.
+
+| Runtime vs n, with fitted exponents | Normalized: T / (n ln n) |
+|---|---|
+| ![scaling](docs/images/example_scaling.png) | ![normalized](docs/images/example_scaling_normalized.png) |
+| One line per K formula, and the dashed line is the fitted power law. The legend gives $b$, $R^2$ and how many $n$ values entered the fit. The bottom panel shows the success rate. | Runtime divided by a chosen reference $f(n)$. A flat curve means $T$ grows like $f(n)$, a rising one faster, a falling one slower. This is often easier to judge than a slope. |
+
+*Illustrative example: n = 50 … 800, L = 2, 10 repetitions per point.*
+
+**The fit is not biased by the budget.** Where some runs hit the budget, the median over the
+finished runs alone is too small, and so would be the exponent. The fit therefore uses the median
+over *all* runs, with unfinished runs counted as +∞. That median is exact whenever more than half of
+the runs finished. At $n$ values where at most half finished, the point is drawn hollow and left
+out of the fit. The exponents are also saved in `scaling_fits.csv`. Treat $b$ as meaningful only with
+several $n$ values over a reasonable range: two points always fit a line perfectly, and the plot
+says so when that happens.
+
 ## The app
 
 `streamlit run app.py` opens a local web app. Everything is explained on the page itself, and every
@@ -122,8 +147,10 @@ input has a help tooltip.
 |---|---|
 | ![About](docs/images/ui_about.png) | ![Trajectory form](docs/images/ui_trajectory.png) |
 | **About the algorithm.** The cGA step by step, why BinVal reduces to the first differing bit, and a glossary of all symbols. | **Trajectory mode.** Parameters on top, and derived values (K, step size 1/K, borders, worst-case time) update as you type. Invalid input is explained, not crashed on. |
-| ![Sweep form](docs/images/ui_sweep.png) | ![Load from file](docs/images/ui_load.png) |
-| **Sweep mode.** Enter n values and K expressions (for example `5*log(n)`, `sqrt(n*log(n))`, `0.3*n`). A table shows the resulting K for every n before anything runs. | **Load from file.** Upload a YAML experiment file (a commented template is included) or use `experiments.yaml`. Every entry is validated and summarized, and you choose which ones to run. |
+| ![Sweep form](docs/images/ui_sweep.png) | ![Scaling form](docs/images/ui_scaling.png) |
+| **Sweep mode.** Enter n values and K expressions (for example `5*log(n)`, `sqrt(n*log(n))`, `0.3*n`). A table shows the resulting K for every n before anything runs. | **Scaling mode.** Choose n as a geometric range or a list, one or more K formulas, and optionally f(n) for the normalized plot. A table shows K and f(n) at every n, and the page warns when there are too few n values for a reliable fit. |
+| ![Scaling results](docs/images/ui_results_scaling.png) | ![Load from file](docs/images/ui_load.png) |
+| **Scaling results.** A table of the fitted exponents, then the log-log plot, the normalized plot and the summary table. | **Load from file.** Upload a YAML experiment file (a commented template is included) or use `experiments.yaml`. Every entry is validated and summarized, and you choose which ones to run. |
 
 **Saving is manual.** A run started in the app is a temporary draft. Below its results, a
 **Save** panel asks for a **name** and a **description**, for example what the experiment is for or
@@ -197,6 +224,16 @@ experiments:
     repetitions: 10
     max_iterations: 2000000
     seed: 42
+
+  - name: my_scaling
+    type: scaling
+    n: {from: 100, to: 3200, factor: 2}   # or {from, to, count}, or a list
+    K_values: ["5*log(n)", "sqrt(n)*log(n)"]
+    L: 1.0
+    repetitions: 20
+    max_iterations: 5000000
+    seed: 42
+    normalize_by: "n*log(n)"             # optional: extra plot of T / f(n)
 ```
 
 Allowed names in expressions: `n`, `log`/`ln` (natural), `log2`, `log10`, `sqrt`, `exp`, `floor`,
@@ -212,7 +249,8 @@ configuration including the description, so it can be traced back and rerun.
 | Experiment type | Files |
 |---|---|
 | **trajectory** | `heatmap.png/.pdf` and `trajectories.png/.pdf` (the plots); `summary.txt`/`.json` (converged count, min/median/max runtime); `rep_XXX.npz` (per repetition: checkpoint times, the frequency matrix, the runtime, and the exact parameters used) |
-| **sweep** | `runtime_vs_K_n<n>.png/.pdf` (one figure per n); `raw_results.csv` (one row per run: n, K, seed, converged, runtime, wall time, …); `summary.csv` (per (n, K): success rate, min/p10/median/p90/max/mean runtime, and `median_censored`) |
+| **sweep** | `runtime_vs_K_n<n>.png/.pdf` (one figure per n); `runtime_vs_n.png/.pdf` (only when the sweep has ≥ 2 values of n); `raw_results.csv` (one row per run: n, K, seed, converged, runtime, wall time, …); `summary.csv` (per (n, K): success rate, min/p10/median/p90/max/mean runtime, and `median_censored`) |
+| **scaling** | `runtime_vs_n.png/.pdf` (log-log with fitted power laws); `runtime_normalized.png/.pdf` (if `normalize_by` is set); `scaling_fits.csv` (per K formula: exponent b, prefactor c, R², which n values were used); `raw_results.csv` and `summary.csv` as for a sweep |
 
 The PDFs are there to go straight into LaTeX. `median_censored` is the median over *all* runs, with
 unfinished runs counted as +∞. Unlike the median over successful runs, it is not biased by the
@@ -244,8 +282,9 @@ budget, and it is defined whenever more than half of the runs finished.
 cga/
   simulator.py      the cGA loop: run_cga(n, K, L, comparator, max_iterations, rng, log_checkpoints)
   comparators.py    BinVal comparator and the registry for other fitness functions
-  experiments.py    config parsing, run_instance(), trajectory and sweep drivers (resumable)
+  experiments.py    config parsing, run_instance(), trajectory / sweep / scaling drivers (resumable)
   plotting.py       all figures
+  analysis.py       power-law fits T ~ c * n^b (budget-unbiased)
   expressions.py    evaluation of expressions such as "5*log(n)"
 app.py              the interactive app (Streamlit)
 run_experiments.py  command-line runner

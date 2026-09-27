@@ -17,6 +17,8 @@ SHOTS = [  # (file, url, width, height, wait seconds, action)
   ("ui_about.png", "?mode=About+the+algorithm", 1440, 960, 6, None),
   ("ui_trajectory.png", "?mode=Trajectory", 1440, 1110, 6, None),
   ("ui_sweep.png", "?mode=Sweep", 1440, 1180, 6, None),
+  ("ui_scaling.png", "?mode=Scaling", 1440, 1250, 6, None),
+  ("ui_results_scaling.png", "?mode=Browse+results&exp=readme_scaling", 1440, 1250, 8, None),
   ("ui_load.png", "?mode=Load+from+file", 1440, 1000, 5, "project"),
   ("ui_results_trajectory.png", "?mode=Browse+results&exp=readme_trajectory", 1440, 1000, 8, None),
   ("ui_results_sweep.png", "?mode=Browse+results&exp=readme_sweep", 1440, 1180, 8, None),

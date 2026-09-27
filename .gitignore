@@ -15,3 +15,4 @@ results/
 
 # Streamlit local secrets
 .streamlit/secrets.toml
+docs/_build/

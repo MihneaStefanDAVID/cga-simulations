@@ -143,7 +143,7 @@ def run_with_ui(entry: dict, fresh: bool) -> Path | None:
             return None
         (out_dir / "experiment.yaml").write_text(entry_yaml(entry))  # exact config, for reproducibility
         status.update(label=f"**{entry['name']}** finished in {fmt_duration(time.perf_counter() - t0)} "
-                            f"→ `{out_dir.relative_to(HERE)}`", state="complete", expanded=False)
+                            f"→ `results/{out_dir.name}`", state="complete", expanded=False)
     return out_dir
 
 
@@ -152,7 +152,11 @@ def show_results(out_dir: Path) -> None:
     if not out_dir.exists():
         st.info("No results yet.")
         return
-    st.caption(f"Files are in `{out_dir}`")
+    try:
+        shown = out_dir.relative_to(HERE)
+    except ValueError:
+        shown = out_dir
+    st.caption(f"Files are in `{shown}/` (inside the project folder)")
     if (out_dir / "raw_results.csv").exists():
         _show_sweep_results(out_dir)
     elif (out_dir / "summary.json").exists():
@@ -298,7 +302,7 @@ def page_about() -> None:
                     "*not converged*, so nothing loops forever.")
     glossary()
     st.subheader("Where things are saved")
-    st.markdown(f"Each experiment writes to `results/<name>/` inside `{HERE}`. Runs are saved as they finish, "
+    st.markdown("Each experiment writes to `results/<name>/` inside the project folder. Runs are saved as they finish, "
                 "so an interrupted experiment continues where it stopped when you start it again with the same "
                 "settings (unless you tick *Start fresh*).")
 
@@ -449,13 +453,13 @@ def page_sweep() -> None:
                 row[f"1/K (n={n})"] = round(1 / K, 5)
             rows.append(row)
         st.dataframe(pd.DataFrame(rows), hide_index=True)
-        m = st.columns(4)
+        st.caption("Borders l = 1/(L·n), u = 1 − l:  " + "  ·  ".join(
+            f"n = {n}: l = {borders(n, cfg.L)[0]:.4g}, u = {borders(n, cfg.L)[1]:.4g}" for n in cfg.ns))
+        m = st.columns(3)
         m[0].metric("Runs in total", f"{len(cfg.ns) * len(cfg.K_exprs) * cfg.repetitions:,}",
                     help="n values × K values × repetitions")
-        m[1].metric("Borders l / u", " · ".join(f"n={n}: {borders(n, cfg.L)[0]:.3g}" for n in cfg.ns),
-                    help="Lower border 1/(L·n) for each n; u = 1 − l.")
-        m[2].metric("Budget per run", f"{cfg.max_iterations:,}")
-        m[3].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg)),
+        m[1].metric("Budget per run", f"{cfg.max_iterations:,}")
+        m[2].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg)),
                     help="Rough estimate if every run uses its full budget.")
         config_actions(entry, "sw")
 
@@ -559,7 +563,10 @@ def page_browse() -> None:
     if not dirs:
         st.info("No results yet. Run an experiment first.")
         return
-    name = st.selectbox("Experiment (most recent first)", [d.name for d in dirs])
+    names = [d.name for d in dirs]
+    wanted = st.query_params.get("exp")
+    name = st.selectbox("Experiment (most recent first)", names,
+                        index=names.index(wanted) if wanted in names else 0)
     out_dir = RESULTS / name
     cfg_file = out_dir / "experiment.yaml"
     if cfg_file.exists():
@@ -580,11 +587,17 @@ PAGES = {
     "Browse results": (page_browse, "reopen earlier experiments"),
 }
 
+# Optional URL parameters: ?mode=Sweep or ?mode=Browse+results&exp=<name> (applied on first load only).
+if "url_applied" not in st.session_state:
+    st.session_state.url_applied = True
+    if st.query_params.get("mode") in PAGES:
+        st.session_state.mode = st.query_params["mode"]
+
 with st.sidebar:
     st.header("🧬 cGA simulator")
     mode = st.radio("Mode", list(PAGES), captions=[c for _, c in PAGES.values()], key="mode")
     st.divider()
-    st.caption(f"Results folder:\n`{RESULTS}`")
+    st.caption("Results folder: `results/` in the project folder")
     st.caption("Same pipeline as `python run_experiments.py`; results from either appear under *Browse results*.")
 
 PAGES[mode][0]()

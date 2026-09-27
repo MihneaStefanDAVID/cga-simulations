@@ -143,6 +143,15 @@ def _plot_frequency_trajectories(cfg: "TrajectoryConfig", reps: list[dict], out_
 # --------------------------------------------------------------------------- #
 
 
+def _stagger(K: np.ndarray, ratio: float = 1.3) -> np.ndarray:
+    """Mark every other K of a run of close neighbours (on the log axis) so labels don't overlap."""
+    up = np.zeros(len(K), dtype=bool)
+    for j in range(1, len(K)):
+        if K[j] / K[j - 1] < ratio and not up[j - 1]:
+            up[j] = True
+    return up
+
+
 def plot_sweep(cfg: "SweepConfig", summary: "pd.DataFrame", out_dir: Path) -> None:
     for n in cfg.ns:
         _plot_sweep_n(cfg, summary[summary["n"] == n].sort_values("K"), n, out_dir)
@@ -167,9 +176,11 @@ def _plot_sweep_n(cfg: "SweepConfig", s: "pd.DataFrame", n: int, out_dir: Path) 
                 label="median", zorder=4)
         ax.plot(K[ok], s["runtime_mean"][ok], color=SERIES[1], lw=1.2, ls="--", marker="s", ms=4,
                 label="mean", zorder=3)
-        for k, med, succ, r in zip(K[ok], s["runtime_median"][ok], s["successes"][ok], reps[ok]):
-            ax.annotate(f"{succ}/{r}", (k, med), xytext=(0, -9), textcoords="offset points",
-                        ha="center", va="top", fontsize=8, color=TEXT_MUTED)
+        shift = _stagger(K)
+        for k, med, succ, r, up in zip(K[ok], s["runtime_median"][ok], s["successes"][ok], reps[ok], shift[ok]):
+            # Staggered points put their label above the marker instead of below.
+            ax.annotate(f"{succ}/{r}", (k, med), xytext=(0, 9 if up else -9), textcoords="offset points",
+                        ha="center", va="bottom" if up else "top", fontsize=8, color=TEXT_MUTED)
         ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0))
     else:
         ax.text(0.5, 0.5, "no repetition reached the optimum within the budget",
@@ -190,7 +201,8 @@ def _plot_sweep_n(cfg: "SweepConfig", s: "pd.DataFrame", n: int, out_dir: Path) 
     ax_s.set_ylabel("P(success)")
     ax_s.set_xlabel("K (log scale)")
     ax_s.set_xticks(K)
-    ax_s.set_xticklabels([f"{e}\n({k:.3g})" for e, k in zip(s["K_expr"], K)], rotation=30,
+    ax_s.set_xticklabels([("\n\n\n" if up else "") + f"{e}\n({k:.3g})"
+                          for e, k, up in zip(s["K_expr"], K, _stagger(K))], rotation=30,
                          ha="right", fontsize=8)
     ax_s.minorticks_off()
     ax.minorticks_off()

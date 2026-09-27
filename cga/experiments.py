@@ -13,7 +13,7 @@ import json
 import multiprocessing
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence, Union
@@ -25,7 +25,7 @@ import yaml
 from . import plotting
 from .analysis import scaling_fits
 from .expressions import eval_expr
-from .instance import InstanceSpec, run_instance, timed_run  # noqa: F401  (re-exported)
+from .instance import SLOT_FIELDS, InstanceSpec, init_worker, run_instance, timed_run  # noqa: F401  (re-exported)
 from .simulator import RunResult
 
 # Optional hooks so that a UI can follow progress; the CLI just uses print.
@@ -58,6 +58,32 @@ def resolve_workers(requested: int, log: LogFn = print) -> int:
     return requested
 
 
+HEARTBEAT_SECONDS = 2.0
+# Shared progress objects of interrupted pools: kept referenced for a while, because worker processes
+# that were still starting up need them to exist (their semaphore is unlinked on garbage collection).
+_KEEPALIVE: list = []
+
+
+def _fmt_iters(t: float) -> str:
+    return f"{t / 1e6:.1f}M" if t >= 1e6 else f"{t / 1e3:.0f}k" if t >= 1e3 else f"{int(t)}"
+
+
+def _live_status(shared, workers: int) -> str:
+    """Summary of the runs in progress, read from the workers' shared progress slots."""
+    runs = [(shared[i * SLOT_FIELDS], shared[i * SLOT_FIELDS + 1], shared[i * SLOT_FIELDS + 2])
+            for i in range(workers)]
+    runs = [r for r in runs if r[0] > 0]
+    if not runs:
+        return "starting worker processes"
+    ns = sorted({int(n) for n, _, _ in runs})
+    lo, hi = min(t for _, t, _ in runs), max(t for _, t, _ in runs)
+    budget = max(m for _, _, m in runs)
+    n_txt = f"n = {ns[0]}" if len(ns) == 1 else f"n = {ns[0]}–{ns[-1]}"
+    it_txt = _fmt_iters(lo) if lo == hi else f"{_fmt_iters(lo)}–{_fmt_iters(hi)}"
+    pct = f"{100 * lo / budget:.0f}%" if lo == hi else f"{100 * lo / budget:.0f}–{100 * hi / budget:.0f}%"
+    return f"{len(runs)} runs in progress ({n_txt}): {it_txt} of {_fmt_iters(budget)} iterations ({pct} of budget)"
+
+
 def _iter_results(
     jobs: Sequence[tuple[Any, InstanceSpec]],
     workers: int,
@@ -70,28 +96,57 @@ def _iter_results(
     separate OS processes (real parallelism; the pure-Python loop is GIL-bound, so threads
     would not help) and yields in completion order. The caller writes each result to disk as
     soon as it is yielded, so an interrupted experiment keeps every finished instance.
+
+    progress() also fires while runs are still going (iterations done so far), so long runs
+    never look frozen: in parallel mode every HEARTBEAT_SECONDS, in sequential mode every few
+    hundred thousand iterations.
     """
     total = len(jobs)
     if workers <= 1:
         for i, (tag, spec) in enumerate(jobs):
-            progress(i, total, f"running {describe(tag)}")
-            yield (tag, *timed_run(spec))
+            label = describe(tag)
+            progress(i, total, f"running {label}")
+
+            def live(t: int, i=i, label=label, budget=spec.max_iterations) -> None:
+                progress(i, total, f"running {label}: {_fmt_iters(t)} of {_fmt_iters(budget)} iterations "
+                                   f"({100 * t / budget:.0f}% of budget)")
+            yield (tag, *timed_run(spec, live))
         return
+    ctx = multiprocessing.get_context("spawn")  # safe inside a multithreaded host such as the Streamlit server
+    shared = ctx.RawArray("d", SLOT_FIELDS * workers)  # live (n, iterations, budget); one writer per slot
+    counter = ctx.Value("i", 0)
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=init_worker,
+                               initargs=(shared, counter))
     # Largest n first, so the slowest runs do not all start at the end (results do not depend on order).
     ordered = sorted(jobs, key=lambda job: -job[1].n)
-    # spawn: safe inside a multithreaded host such as the Streamlit server, and the same on every OS.
-    pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+    completed = False
     try:
         futures = {pool.submit(timed_run, spec): tag for tag, spec in ordered}
         progress(0, total, f"started {total} runs on {workers} worker processes")
-        for done, fut in enumerate(as_completed(futures), 1):
-            tag = futures[fut]
-            res, wall = fut.result()
-            progress(done, total, f"finished {describe(tag)}")
-            yield tag, res, wall
+        pending, done = set(futures), 0
+        while pending:
+            finished, pending = wait(pending, timeout=HEARTBEAT_SECONDS, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                tag = futures[fut]
+                res, wall = fut.result()
+                done += 1
+                progress(done, total, f"finished {describe(tag)}")
+                yield tag, res, wall
+            if not finished:
+                progress(done, total, _live_status(shared, workers))
+        completed = True
     finally:
-        # On interruption (Ctrl-C, Streamlit rerun) drop queued runs instead of waiting for them.
-        pool.shutdown(wait=False, cancel_futures=True)
+        if completed:
+            pool.shutdown(wait=True)  # every run is done, so this only waits for the workers to exit
+        else:
+            # Interrupted (Ctrl-C, Streamlit rerun): drop queued runs, and stop the running ones. Their
+            # results could no longer be collected, and a single long run can take many minutes.
+            running = list((getattr(pool, "_processes", None) or {}).values())  # shutdown() clears this
+            pool.shutdown(wait=False, cancel_futures=True)
+            for proc in running:
+                proc.terminate()
+            _KEEPALIVE.append((shared, counter))
+            del _KEEPALIVE[:-4]
 
 
 # --------------------------------------------------------------------------- #
@@ -508,6 +563,7 @@ def _run_grid(
         writer = csv.DictWriter(fh, fieldnames=RAW_COLUMNS)
         if new_file:
             writer.writeheader()
+            fh.flush()
         jobs = [(task, task.spec) for task in todo]
         describe = lambda t: f"n={t.spec.n}, K={t.K_expr}, rep {t.repetition}"  # noqa: E731
         for i, (task, res, wall) in enumerate(_iter_results(jobs, workers, progress, describe), 1):

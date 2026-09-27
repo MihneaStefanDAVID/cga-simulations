@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -19,6 +20,23 @@ import yaml
 from cga.experiments import default_workers, parse_experiment, run_experiment
 
 HERE = Path(__file__).resolve().parent
+
+
+def _status_printer(every: float = 30.0):
+    """Progress callback that prints a status line at most every `every` seconds.
+
+    Finished runs are already logged one per line; this keeps long runs from looking frozen.
+    """
+    start = last = time.time()
+
+    def progress(done: int, total: int, message: str) -> None:
+        nonlocal last
+        now = time.time()
+        if now - last >= every:
+            last = now
+            print(f"  [{time.strftime('%H:%M:%S')}] {done}/{total} done, {(now - start) / 60:.1f} min elapsed · "
+                  f"{message}", flush=True)
+    return progress
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,7 +74,8 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--workers must be at least 1")
     for entry in entries:
         workers = args.workers if args.workers is not None else entry.get("workers", default_workers())
-        run_experiment(entry, args.results, fresh=args.fresh, plot_only=args.plot_only, workers=workers)
+        run_experiment(entry, args.results, fresh=args.fresh, plot_only=args.plot_only, workers=workers,
+                       progress=_status_printer())
     return 0
 
 

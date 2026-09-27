@@ -241,6 +241,46 @@ def test_workers_clamped_not_rejected():
         raise AssertionError("accepted workers: 0 in an experiment entry")
 
 
+def test_progress_callback_does_not_change_run():
+    calls = []
+    kw = dict(n=50, K=1e9, L=1.0, comparator=binval_comparator, max_iterations=1000)
+    a = run_cga(**kw, rng=np.random.default_rng(0), on_progress=calls.append, progress_every=100)
+    b = run_cga(**kw, rng=np.random.default_rng(0))
+    assert calls == list(range(100, 1001, 100))
+    assert (a.converged, a.runtime, a.iterations) == (b.converged, b.runtime, b.iterations)
+
+
+class _Stop(Exception):
+    pass
+
+
+def test_interrupt_terminates_workers():
+    import math
+    import multiprocessing
+    import time
+    from cga.experiments import _iter_results
+    if (os.cpu_count() or 1) < 2:
+        print("  (skipped: fewer than 2 CPUs)")
+        return
+    jobs = [(r, InstanceSpec(200, 5 * math.log(200), 1.0, "binval", 50_000_000, r)) for r in range(4)]
+    seen = []
+
+    def progress(done, total, msg):  # stop at the first heartbeat, like a Streamlit rerun
+        seen.append(msg)
+        if "in progress" in msg:
+            raise _Stop
+
+    try:
+        list(_iter_results(jobs, 2, progress, str))
+    except _Stop:
+        pass
+    deadline = time.time() + 5
+    while multiprocessing.active_children() and time.time() < deadline:
+        time.sleep(0.1)
+    assert not multiprocessing.active_children(), "worker processes still running after interruption"
+    assert any("in progress" in m for m in seen)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

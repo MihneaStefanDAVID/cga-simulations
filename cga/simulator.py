@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -46,12 +46,17 @@ def run_cga(
     max_iterations: int,
     rng: np.random.Generator,
     log_checkpoints: bool = False,
+    on_progress: Optional[Callable[[int], None]] = None,
+    progress_every: int = 1 << 16,
 ) -> RunResult:
     """Run the cGA once until the optimum is sampled or max_iterations is reached.
 
     With log_checkpoints, p^(t) is recorded at t = 0, 1, 2, 4, 8, ... (doubling),
     plus once more at the end of the run: at t = T-1 (the distribution the optimum
     was sampled from) if the run converged, or at t = max_iterations otherwise.
+
+    on_progress(t), if given, is called every `progress_every` iterations with the number of
+    iterations done so far (for live progress displays; it does not affect the run).
     """
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}")
@@ -71,6 +76,7 @@ def run_cga(
     times: list[int] = []
     snaps: list[np.ndarray] = []
     next_ckpt = 1
+    next_report = progress_every if on_progress is not None else max_iterations + 1
     if log_checkpoints:
         times.append(0)
         snaps.append(p.copy())
@@ -96,6 +102,10 @@ def run_cga(
             # W_i - L_i is +1 (W_i=1, L_i=0), -1 (W_i=0, L_i=1) or 0 (bits agree).
             p += step * (W.astype(np.int8) - Lo.astype(np.int8))
             np.clip(p, lo, hi, out=p)
+
+        if t == next_report:
+            on_progress(t)
+            next_report += progress_every
 
         if log_checkpoints and t == next_ckpt:
             times.append(t)

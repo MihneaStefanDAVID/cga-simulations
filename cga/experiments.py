@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from . import plotting
 from .comparators import make_comparator
@@ -68,7 +69,7 @@ def run_instance(spec: InstanceSpec) -> RunResult:
 # --------------------------------------------------------------------------- #
 
 _COMMON_REQUIRED = {"name", "type", "L", "repetitions", "max_iterations", "seed"}
-_COMMON_OPTIONAL = {"fitness"}
+_COMMON_OPTIONAL = {"fitness", "description"}  # description: free text, not used by the simulation
 
 
 def _check_keys(entry: dict, required: set, optional: set) -> None:
@@ -465,4 +466,7 @@ def run_experiment(
     log(f"=== {cfg.name} ({entry['type']}) -> {out_dir}")
     runner = run_trajectory if isinstance(cfg, TrajectoryConfig) else run_sweep
     runner(cfg, out_dir, fresh=fresh, plot_only=plot_only, log=log, progress=progress)
+    # The exact entry (including any description), so results can be traced back and rerun.
+    (out_dir / "experiment.yaml").write_text(
+        yaml.safe_dump({"experiments": [entry]}, sort_keys=False, allow_unicode=True))
     return out_dir

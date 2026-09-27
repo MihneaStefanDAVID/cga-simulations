@@ -27,6 +27,7 @@ experiments:
   # Output: heatmap of p_{i,t}, trajectories of selected bits, runtime summary.
   # --------------------------------------------------------------------------
   - name: my_trajectory          # unique; results/my_trajectory/
+    description: "What this experiment is for"   # optional free text, shown in the app
     type: trajectory
     fitness: binval              # optional (default binval); only binval is implemented so far
     n: 100                       # number of bits
@@ -47,6 +48,7 @@ experiments:
   #         raw_results.csv and summary.csv.
   # --------------------------------------------------------------------------
   - name: my_sweep
+    description: "Runtime vs K for two small n"   # optional
     type: sweep
     fitness: binval
     n: [50, 100]                 # one number or a list

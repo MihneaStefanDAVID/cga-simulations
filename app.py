@@ -2,15 +2,19 @@
 
 Start with:  streamlit run app.py      (or double-click start_ui.command on macOS)
 
-It uses the same pipeline as run_experiments.py, so results and plots land in
-the same results/<name>/ folders and can be reopened from either tool.
+It uses the same pipeline as run_experiments.py. Runs started here are *drafts*
+(results/.drafts/) until the user saves them under a name and description; saved
+experiments live in results/<name>/, like those run from the terminal.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
+import re
+import shutil
 import time
 from pathlib import Path
 
@@ -26,6 +30,10 @@ HERE = Path(__file__).resolve().parent
 RESULTS = HERE / "results"
 CONFIG = HERE / "experiments.yaml"
 TEMPLATE = HERE / "experiment_template.yaml"
+DRAFTS = RESULTS / ".drafts"  # unsaved runs: DRAFTS/<hash of settings>/unsaved/
+DRAFT_NAME = "unsaved"
+DRAFT_MAX_AGE_DAYS = 7
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 IMPLEMENTED_FITNESS = ["binval"]  # other comparators are registered as stubs in cga/comparators.py
 
 st.set_page_config(page_title="cGA simulator", page_icon="🧬", layout="wide")
@@ -35,7 +43,7 @@ st.set_page_config(page_title="cGA simulator", page_icon="🧬", layout="wide")
 # --------------------------------------------------------------------------- #
 
 DEFAULTS = {
-    "tr_name": "ui_trajectory",
+    "tr_export_name": "my_trajectory",
     "tr_n": 200,
     "tr_K": "5*log(n)",
     "tr_L": 1.0,
@@ -45,8 +53,7 @@ DEFAULTS = {
     "tr_fitness": "binval",
     "tr_track": "",
     "tr_heat": 0,
-    "tr_fresh": False,
-    "sw_name": "ui_sweep",
+    "sw_export_name": "my_sweep",
     "sw_ns": "50, 100",
     "sw_Ks": "2*log(n)\n5*log(n)\nsqrt(n*log(n))\nn",
     "sw_L": 1.0,
@@ -54,8 +61,6 @@ DEFAULTS = {
     "sw_maxit": 200_000,
     "sw_seed": 42,
     "sw_fitness": "binval",
-    "sw_fresh": False,
-    "lf_fresh": False,
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
@@ -119,10 +124,10 @@ def validate(entry: dict):
         return None, str(exc)
 
 
-def run_with_ui(entry: dict, fresh: bool) -> Path | None:
+def run_with_ui(entry: dict, results_root: Path, label: str) -> Path | None:
     """Run one experiment with a progress bar and a live log. Returns the results folder."""
     log_lines: list[str] = []
-    with st.status(f"Running **{entry['name']}** …", expanded=True) as status:
+    with st.status(f"Running **{label}** …", expanded=True) as status:
         bar = st.progress(0.0, text="starting")
         log_box = st.empty()
         t0 = time.perf_counter()
@@ -137,14 +142,124 @@ def run_with_ui(entry: dict, fresh: bool) -> Path | None:
                                               f"elapsed {fmt_duration(time.perf_counter() - t0)}")
 
         try:
-            out_dir = run_experiment(entry, RESULTS, fresh=fresh, log=log, progress=progress)
+            out_dir = run_experiment(entry, results_root, log=log, progress=progress)
         except Exception as exc:
-            status.update(label=f"**{entry['name']}** failed: {exc}", state="error")
+            status.update(label=f"**{label}** failed: {exc}", state="error")
             return None
-        (out_dir / "experiment.yaml").write_text(entry_yaml(entry))  # exact config, for reproducibility
-        status.update(label=f"**{entry['name']}** finished in {fmt_duration(time.perf_counter() - t0)} "
-                            f"→ `results/{out_dir.name}`", state="complete", expanded=False)
+        status.update(label=f"**{label}** finished in {fmt_duration(time.perf_counter() - t0)} (not saved yet)",
+                      state="complete", expanded=False)
     return out_dir
+
+
+def _core(entry: dict) -> dict:
+    """The settings that determine the simulation (everything except name and description)."""
+    return {k: v for k, v in entry.items() if k not in ("name", "description")}
+
+
+def run_draft(entry: dict, label: str) -> dict | None:
+    """Run an experiment as an unsaved draft. Returns a run record for show_run(), or None on failure.
+
+    The draft folder is keyed by the settings, so rerunning identical settings continues an
+    interrupted run instead of starting over (runs are deterministic given the seed).
+    """
+    key = hashlib.sha1(json.dumps(_core(entry), sort_keys=True).encode()).hexdigest()[:12]
+    out = run_with_ui({"name": DRAFT_NAME, **_core(entry)}, DRAFTS / key, label)
+    if out is None:
+        return None
+    return {"id": f"{key}_{time.time_ns()}", "dir": str(out), "entry": entry, "saved": None}
+
+
+def save_run(run: dict, name: str, description: str, overwrite: bool, add_to_config: bool) -> str | None:
+    """Move a draft to results/<name>/ with its description. Returns an error message or None."""
+    name, description = name.strip(), description.strip()
+    if not NAME_RE.fullmatch(name):
+        return ("Please choose a name made of letters, digits, '_', '-' or '.', starting with a letter or digit "
+                "(no spaces).")
+    target = RESULTS / name
+    if target.exists() and not overwrite:
+        return f"An experiment named **{name}** already exists. Choose another name or tick *Overwrite*."
+    entry = {"name": name, **({"description": description} if description else {}), **_core(run["entry"])}
+    if add_to_config:
+        err = append_to_config(entry)
+        if err:
+            return err
+    if target.exists():
+        shutil.rmtree(target)
+    src = Path(run["dir"])
+    shutil.move(str(src), str(target))
+    shutil.rmtree(src.parent, ignore_errors=True)
+    # Redraw plots and summaries so they carry the real name, and store the final experiment.yaml.
+    run_experiment(entry, RESULTS, plot_only=True, log=lambda _msg: None)
+    run.update(saved=name, entry=entry)
+    return None
+
+
+def prune_old_drafts() -> None:
+    if not DRAFTS.exists():
+        return
+    cutoff = time.time() - DRAFT_MAX_AGE_DAYS * 86400
+    for d in DRAFTS.iterdir():
+        if d.is_dir() and d.stat().st_mtime < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def read_description(out_dir: Path) -> str:
+    try:
+        entry = yaml.safe_load((out_dir / "experiment.yaml").read_text())["experiments"][0]
+        return str(entry.get("description") or "")
+    except Exception:
+        return ""
+
+
+def show_run(run: dict) -> None:
+    """Results of a run started in the app, with the Save / Discard panel while it is a draft."""
+    if run.get("discarded"):
+        st.info("These results were discarded.")
+        return
+    if run.get("saved"):
+        name = run["saved"]
+        st.success(f"Saved as **{name}** in `results/{name}/`. You can reopen it any time under *Browse results*.")
+        desc = run["entry"].get("description")
+        if desc:
+            st.markdown(f"> {desc}")
+        show_results(RESULTS / name)
+        return
+    if not Path(run["dir"]).exists():
+        st.info("These unsaved results are no longer available.")
+        return
+
+    rid = run["id"]
+    st.warning(f"**Not saved yet.** These results are in a temporary folder. Save them under a name (with a "
+               f"description), or discard them. Unsaved results are deleted automatically after "
+               f"{DRAFT_MAX_AGE_DAYS} days.")
+    with st.form(f"save_{rid}"):
+        st.markdown("**💾 Save this experiment**")
+        c1, c2 = st.columns([1, 2])
+        name = c1.text_input("Name", value=run["entry"].get("name", ""), key=f"{rid}_name",
+                             placeholder="e.g. traj_n200_K5logn_L1",
+                             help="Becomes the folder results/<name>/. Letters, digits, _ - . (no spaces).")
+        desc = c2.text_area("Description", value=run["entry"].get("description", ""), key=f"{rid}_desc",
+                            height=100, placeholder="What is this experiment for? What did you observe?",
+                            help="Free text, stored with the results in experiment.yaml and shown under Browse "
+                                 "results. It does not affect the simulation.")
+        c3, c4 = st.columns(2)
+        overwrite = c3.checkbox("Overwrite an existing experiment with the same name", key=f"{rid}_over")
+        add_cfg = c4.checkbox("Also add it to experiments.yaml", key=f"{rid}_cfg",
+                              help="So that `python run_experiments.py` can rerun it from the terminal.")
+        b1, b2, _ = st.columns([1, 1, 5])
+        save = b1.form_submit_button("💾 Save", type="primary")
+        discard = b2.form_submit_button("🗑 Discard")
+    if save:
+        err = save_run(run, name, desc, overwrite, add_cfg)
+        if err:
+            st.error(err)
+        else:
+            st.rerun()
+    elif discard:
+        shutil.rmtree(Path(run["dir"]).parent, ignore_errors=True)
+        run["discarded"] = True
+        st.rerun()
+    show_results(Path(run["dir"]))
 
 
 def show_results(out_dir: Path) -> None:
@@ -152,11 +267,14 @@ def show_results(out_dir: Path) -> None:
     if not out_dir.exists():
         st.info("No results yet.")
         return
-    try:
-        shown = out_dir.relative_to(HERE)
-    except ValueError:
-        shown = out_dir
-    st.caption(f"Files are in `{shown}/` (inside the project folder)")
+    if DRAFTS in out_dir.parents:
+        st.caption("Files are in a temporary folder until you save them.")
+    else:
+        try:
+            shown = out_dir.relative_to(HERE)
+        except ValueError:
+            shown = out_dir
+        st.caption(f"Files are in `{shown}/` (inside the project folder)")
     if (out_dir / "raw_results.csv").exists():
         _show_sweep_results(out_dir)
     elif (out_dir / "summary.json").exists():
@@ -224,12 +342,18 @@ def _downloads(out_dir: Path, names: list[str]) -> None:
         return
     cols = st.columns(len(files))
     for col, f in zip(cols, files):
-        col.download_button(f"⬇ {f.name}", f.read_bytes(), file_name=f.name, key=f"dl_{out_dir.name}_{f.name}")
+        tag = hashlib.md5(str(out_dir).encode()).hexdigest()[:8]
+        col.download_button(f"⬇ {f.name}", f.read_bytes(), file_name=f.name, key=f"dl_{tag}_{f.name}")
 
 
-def config_actions(entry: dict, prefix: str) -> None:
-    """YAML preview, download, and 'add to experiments.yaml'."""
-    with st.expander("This experiment as YAML (for experiments.yaml or an upload file)"):
+def config_actions(core: dict, prefix: str) -> None:
+    """Export the current settings as YAML (download or add to experiments.yaml) without running them here."""
+    with st.expander("Export as YAML instead (e.g. to run a long experiment from the terminal)"):
+        name = st.text_input("Name for the exported experiment", key=f"{prefix}_export_name").strip()
+        if not NAME_RE.fullmatch(name):
+            st.error("Use letters, digits, '_', '-' or '.', starting with a letter or digit (no spaces).")
+            return
+        entry = {"name": name, **core}
         text = entry_yaml(entry)
         st.code(text, language="yaml")
         c1, c2 = st.columns(2)
@@ -302,9 +426,13 @@ def page_about() -> None:
                     "*not converged*, so nothing loops forever.")
     glossary()
     st.subheader("Where things are saved")
-    st.markdown("Each experiment writes to `results/<name>/` inside the project folder. Runs are saved as they finish, "
-                "so an interrupted experiment continues where it stopped when you start it again with the same "
-                "settings (unless you tick *Start fresh*).")
+    st.markdown(
+        "Nothing is saved automatically. After a run, the results are shown together with a **Save** panel: give the "
+        "experiment a name and a description, and it is stored in `results/<name>/` inside the project folder "
+        "(plots, data, and the exact configuration in `experiment.yaml`). Saved experiments appear under "
+        "*Browse results*. Until then the run is a temporary draft; you can discard it, and unsaved drafts are "
+        f"deleted after {DRAFT_MAX_AGE_DAYS} days. If a run is interrupted, starting it again with the same settings "
+        "continues where it stopped.")
 
 
 def page_trajectory() -> None:
@@ -320,8 +448,6 @@ def page_trajectory() -> None:
     st.subheader("Parameters")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.text_input("Experiment name", key="tr_name",
-                      help="Results go to results/<name>/. Re-using a name with identical settings reuses saved runs.")
         st.number_input("n — number of bits", key="tr_n", min_value=1, step=10)
         st.text_input("K — population size (number or expression in n)", key="tr_K",
                       help="Step size is 1/K. Examples: 50, 5*log(n), sqrt(n*log(n)), 0.3*n. log is the natural log.")
@@ -345,7 +471,7 @@ def page_trajectory() -> None:
 
     ss = st.session_state
     entry = {
-        "name": ss.tr_name.strip(), "type": "trajectory", "fitness": ss.tr_fitness,
+        "name": DRAFT_NAME, "type": "trajectory", "fitness": ss.tr_fitness,
         "n": int(ss.tr_n), "K": ss.tr_K.strip(), "L": float(ss.tr_L), "repetitions": int(ss.tr_reps),
         "max_iterations": int(ss.tr_maxit), "seed": int(ss.tr_seed),
     }
@@ -359,7 +485,7 @@ def page_trajectory() -> None:
         entry["heatmap_repetition"] = int(ss.tr_heat)
 
     cfg, error = validate(entry)
-    error = track_error or error or (None if entry["name"] else "Please enter an experiment name.")
+    error = track_error or error
 
     st.subheader("Resulting values")
     if error:
@@ -376,18 +502,19 @@ def page_trajectory() -> None:
         st.caption(f"Tracked bits: {', '.join(map(str, cfg.track_indices))} · "
                    f"checkpoints per run: about {int(math.log2(cfg.max_iterations)) + 2} "
                    f"(t = 0, 1, 2, 4, …, {2 ** int(math.log2(cfg.max_iterations)):,})")
-        config_actions(entry, "tr")
+        config_actions(_core(entry), "tr")
 
     st.subheader("Run")
-    st.checkbox("Start fresh (discard saved runs for this name)", key="tr_fresh")
-    st.caption("While a run is going, changing any input stops it. Finished repetitions are saved and reused.")
+    st.caption("Results are not saved automatically: after the run you can save them under a name and description. "
+               "Changing any input while a run is going stops it; running the same settings again continues "
+               "where it stopped.")
     if st.button("▶ Run trajectory experiment", type="primary", disabled=bool(error)):
-        out = run_with_ui(entry, fresh=ss.tr_fresh)
-        if out:
-            ss.tr_last = str(out)
-    if ss.get("tr_last"):
-        st.subheader(f"Results — {Path(ss.tr_last).name}")
-        show_results(Path(ss.tr_last))
+        run = run_draft(_core(entry), "trajectory experiment")
+        if run:
+            ss.tr_run = run
+    if ss.get("tr_run"):
+        st.subheader("Results")
+        show_run(ss.tr_run)
 
 
 def _parse_ns(text: str) -> list[int]:
@@ -408,7 +535,6 @@ def page_sweep() -> None:
     st.subheader("Parameters")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.text_input("Experiment name", key="sw_name")
         st.text_input("n values (comma-separated)", key="sw_ns", help="One figure is produced per n.")
         st.number_input("L — border factor", key="sw_L", min_value=0.01, step=0.05, format="%.3f",
                         help="Borders l = 1/(L·n), u = 1 − l. L = 1: standard borders.")
@@ -430,13 +556,11 @@ def page_sweep() -> None:
         ns, ns_error = [], "n values must be whole numbers separated by commas."
     K_exprs = [line.strip() for line in ss.sw_Ks.splitlines() if line.strip()]
     entry = {
-        "name": ss.sw_name.strip(), "type": "sweep", "fitness": ss.sw_fitness, "n": ns, "K_values": K_exprs,
+        "name": DRAFT_NAME, "type": "sweep", "fitness": ss.sw_fitness, "n": ns, "K_values": K_exprs,
         "L": float(ss.sw_L), "repetitions": int(ss.sw_reps), "max_iterations": int(ss.sw_maxit),
         "seed": int(ss.sw_seed),
     }
     cfg, error = validate(entry) if not ns_error else (None, ns_error)
-    if not error and not entry["name"]:
-        error = "Please enter an experiment name."
     if not error and not K_exprs:
         error = "Enter at least one K value."
 
@@ -461,19 +585,19 @@ def page_sweep() -> None:
         m[1].metric("Budget per run", f"{cfg.max_iterations:,}")
         m[2].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg)),
                     help="Rough estimate if every run uses its full budget.")
-        config_actions(entry, "sw")
+        config_actions(_core(entry), "sw")
 
     st.subheader("Run")
-    st.checkbox("Start fresh (discard saved runs for this name)", key="sw_fresh")
-    st.caption("Runs already in raw_results.csv with the same settings are skipped, so you can add K values or n "
-               "and only the new combinations run. Changing an input during a run stops it; finished runs are kept.")
+    st.caption("Results are not saved automatically: after the run you can save them under a name and description. "
+               "Changing any input while a run is going stops it; running the same settings again continues "
+               "where it stopped.")
     if st.button("▶ Run sweep", type="primary", disabled=bool(error)):
-        out = run_with_ui(entry, fresh=ss.sw_fresh)
-        if out:
-            ss.sw_last = str(out)
-    if ss.get("sw_last"):
-        st.subheader(f"Results — {Path(ss.sw_last).name}")
-        show_results(Path(ss.sw_last))
+        run = run_draft(_core(entry), "sweep")
+        if run:
+            ss.sw_run = run
+    if ss.get("sw_run"):
+        st.subheader("Results")
+        show_run(ss.sw_run)
 
 
 def _describe(cfg) -> dict:
@@ -536,38 +660,49 @@ def page_load() -> None:
         return
 
     st.subheader(f"{len(parsed)} valid experiment(s)")
-    st.dataframe(pd.DataFrame([_describe(cfg) for _, cfg in parsed.values()]), hide_index=True)
+    overview = pd.DataFrame([_describe(cfg) for _, cfg in parsed.values()])
+    descriptions = [str(e.get("description") or "") for e, _ in parsed.values()]
+    if any(descriptions):
+        overview.insert(1, "description", descriptions)
+    st.dataframe(overview, hide_index=True)
     chosen = st.multiselect("Experiments to run", list(parsed), default=list(parsed))
     total = sum(worst_case_seconds(parsed[n][1]) for n in chosen)
-    st.caption(f"Worst-case total time: {fmt_duration(total)} (rough estimate, every run using its full budget).")
-    st.checkbox("Start fresh (discard saved runs for these names)", key="lf_fresh")
+    st.caption(f"Worst-case total time: {fmt_duration(total)} (rough estimate, every run using its full budget). "
+               "Results are not saved automatically: each one gets its own Save panel, with the name and description "
+               "from the file filled in.")
 
     if st.button("▶ Run selected", type="primary", disabled=not chosen):
-        done = []
+        runs = []
         for name in chosen:
-            out = run_with_ui(parsed[name][0], fresh=st.session_state.lf_fresh)
-            if out:
-                done.append(str(out))
-        st.session_state.lf_last = done
-    last = st.session_state.get("lf_last") or []
-    if last:
+            run = run_draft(parsed[name][0], name)
+            if run:
+                runs.append(run)
+        st.session_state.lf_runs = runs
+    runs = st.session_state.get("lf_runs") or []
+    if runs:
         st.subheader("Results")
-        for tab, path in zip(st.tabs([Path(p).name for p in last]), last):
+        labels = [("✅ " if r.get("saved") else "🗑 " if r.get("discarded") else "✏️ ") + r["entry"]["name"]
+                  for r in runs]
+        for tab, run in zip(st.tabs(labels), runs):
             with tab:
-                show_results(Path(path))
+                show_run(run)
 
 
 def page_browse() -> None:
     st.title("Browse results")
-    dirs = sorted((d for d in RESULTS.glob("*") if d.is_dir()), key=lambda d: d.stat().st_mtime, reverse=True)
+    dirs = sorted((d for d in RESULTS.glob("*") if d.is_dir() and not d.name.startswith(".")),
+                  key=lambda d: d.stat().st_mtime, reverse=True)
     if not dirs:
-        st.info("No results yet. Run an experiment first.")
+        st.info("No saved experiments yet. Run one and save it.")
         return
     names = [d.name for d in dirs]
     wanted = st.query_params.get("exp")
     name = st.selectbox("Experiment (most recent first)", names,
                         index=names.index(wanted) if wanted in names else 0)
     out_dir = RESULTS / name
+    desc = read_description(out_dir)
+    if desc:
+        st.markdown(f"> {desc}")
     cfg_file = out_dir / "experiment.yaml"
     if cfg_file.exists():
         with st.expander("Configuration used"):
@@ -584,12 +719,13 @@ PAGES = {
     "Trajectory": (page_trajectory, "one (n, K, L), frequencies over time"),
     "Sweep": (page_sweep, "runtime vs K, for one or more n"),
     "Load from file": (page_load, "upload a YAML experiment file"),
-    "Browse results": (page_browse, "reopen earlier experiments"),
+    "Browse results": (page_browse, "reopen saved experiments"),
 }
 
 # Optional URL parameters: ?mode=Sweep or ?mode=Browse+results&exp=<name> (applied on first load only).
 if "url_applied" not in st.session_state:
     st.session_state.url_applied = True
+    prune_old_drafts()
     if st.query_params.get("mode") in PAGES:
         st.session_state.mode = st.query_params["mode"]
 
@@ -597,7 +733,7 @@ with st.sidebar:
     st.header("🧬 cGA simulator")
     mode = st.radio("Mode", list(PAGES), captions=[c for _, c in PAGES.values()], key="mode")
     st.divider()
-    st.caption("Results folder: `results/` in the project folder")
-    st.caption("Same pipeline as `python run_experiments.py`; results from either appear under *Browse results*.")
+    st.caption("Runs are drafts until you save them. Saved experiments go to `results/<name>/` in the project "
+               "folder and appear under *Browse results*, together with experiments run from the terminal.")
 
 PAGES[mode][0]()

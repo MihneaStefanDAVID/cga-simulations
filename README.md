@@ -125,8 +125,14 @@ input has a help tooltip.
 | ![Sweep form](docs/images/ui_sweep.png) | ![Load from file](docs/images/ui_load.png) |
 | **Sweep mode.** Enter n values and K expressions (for example `5*log(n)`, `sqrt(n*log(n))`, `0.3*n`). A table shows the resulting K for every n before anything runs. | **Load from file.** Upload a YAML experiment file (a commented template is included) or use `experiments.yaml`. Every entry is validated and summarized, and you choose which ones to run. |
 
-**Browse results** (shown at the top of this page) reopens any earlier experiment, whether it was
-run from the app or from the terminal, including its exact configuration.
+**Saving is manual.** A run started in the app is a temporary draft. Below its results, a
+**Save** panel asks for a **name** and a **description**, for example what the experiment is for or
+what you observed. Saving stores everything in `results/<name>/`. You can also **discard** the run,
+and unsaved drafts are deleted after 7 days. If a run is interrupted, starting it again with the
+same settings continues where it stopped.
+
+**Browse results** (shown at the top of this page) reopens any saved experiment, whether it was run
+from the app or from the terminal, with its description and exact configuration.
 
 <details>
 <summary>Sweep results in the app</summary>
@@ -173,6 +179,7 @@ An experiment file is a list under `experiments:`. The commented template
 ```yaml
 experiments:
   - name: my_trajectory
+    description: "What this experiment is for"   # optional
     type: trajectory
     n: 200
     K: "5 * log(n)"          # number or expression in n (log = natural log)
@@ -197,8 +204,10 @@ Allowed names in expressions: `n`, `log`/`ln` (natural), `log2`, `log10`, `sqrt`
 
 ## Outputs
 
-Each experiment writes to `results/<name>/`. That folder is not tracked by git, so everyone
-produces their own.
+Each saved experiment is a folder `results/<name>/`. Runs from the terminal are saved there
+directly, and runs from the app after you click *Save*. The folder is not tracked by git, so
+everyone produces their own. Every experiment folder contains `experiment.yaml`, the exact
+configuration including the description, so it can be traced back and rerun.
 
 | Experiment type | Files |
 |---|---|

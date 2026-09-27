@@ -36,6 +36,9 @@ experiments:
     repetitions: 5               # independent runs
     max_iterations: 200000       # budget per run; runs that hit it count as "not converged"
     seed: 42                     # repetition r uses seed + r
+    # workers: 4                 # optional: parallel worker processes (separate OS processes, capped at
+    #                            # the CPU count). Does not change the results. The --workers flag of
+    #                            # run_experiments.py and the app's "Parallel workers" field override it.
     # --- optional ---
     # track_indices: [1, 2, 3, 5, 10, 25, 50, 100]   # 1-based bits for the trajectory plot
     #                                                 # default: 1, 2, 3, 5, 10, n//4, n//2, n

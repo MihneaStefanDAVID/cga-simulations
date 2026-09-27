@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 from pathlib import Path
 
@@ -12,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cga.analysis import fit_power_law, scaling_fits  # noqa: E402
 from cga.comparators import binval_comparator  # noqa: E402
-from cga.experiments import InstanceSpec, geometric_ns, parse_experiment, run_experiment, run_instance  # noqa: E402
+from cga.experiments import (KEY_COLUMNS, InstanceSpec, geometric_ns, load_rep, parse_experiment,  # noqa: E402
+                             resolve_workers, run_experiment, run_instance)
 from cga.expressions import eval_expr  # noqa: E402
 from cga.simulator import borders, run_cga  # noqa: E402
 
@@ -168,6 +170,75 @@ def test_scaling_pipeline(tmp_path=None):
     for f in ["raw_results.csv", "summary.csv", "scaling_fits.csv", "runtime_vs_n.png",
               "runtime_normalized.png", "experiment.yaml"]:
         assert (out / f).exists(), f
+
+
+def _parallel_workers() -> int:
+    return min(4, os.cpu_count() or 1)
+
+
+def _raw_sorted(out: Path):
+    import pandas as pd
+    raw = pd.read_csv(out / "raw_results.csv", dtype={"K_expr": str})
+    return raw.drop(columns="wall_seconds").sort_values(KEY_COLUMNS).reset_index(drop=True)
+
+
+def test_parallel_grid_matches_sequential():
+    import tempfile
+    import pandas as pd
+    w = _parallel_workers()
+    if w < 2:
+        print("  (skipped: fewer than 2 CPUs)")
+        return
+    entry = {"name": "par", "type": "sweep", "n": [12, 24], "K_values": ["2*log(n)", "n"], "L": 1.0,
+             "repetitions": 4, "max_iterations": 20_000, "seed": 3}
+    seq = run_experiment(entry, Path(tempfile.mkdtemp()), log=lambda _m: None, workers=1)
+    par = run_experiment(entry, Path(tempfile.mkdtemp()), log=lambda _m: None, workers=w)
+    a, b = _raw_sorted(seq), _raw_sorted(par)
+    assert len(a) == 16
+    pd.testing.assert_frame_equal(a, b)
+    pd.testing.assert_frame_equal(pd.read_csv(seq / "summary.csv"), pd.read_csv(par / "summary.csv"))
+
+
+def test_parallel_trajectory_matches_sequential():
+    import tempfile
+    w = _parallel_workers()
+    if w < 2:
+        print("  (skipped: fewer than 2 CPUs)")
+        return
+    entry = {"name": "partraj", "type": "trajectory", "n": 20, "K": "3*log(n)", "L": 1.0, "repetitions": 4,
+             "max_iterations": 20_000, "seed": 5}
+    seq = run_experiment(entry, Path(tempfile.mkdtemp()), log=lambda _m: None, workers=1)
+    par = run_experiment(entry, Path(tempfile.mkdtemp()), log=lambda _m: None, workers=w)
+    for r in range(4):
+        x, y = load_rep(seq / f"rep_{r:03d}.npz"), load_rep(par / f"rep_{r:03d}.npz")
+        assert x["runtime"] == y["runtime"] and x["spec"] == y["spec"]
+        np.testing.assert_array_equal(x["p"], y["p"])
+
+
+def test_workers_clamped_not_rejected():
+    import tempfile
+    cpus = os.cpu_count() or 1
+    msgs = []
+    assert resolve_workers(cpus + 5, msgs.append) == cpus
+    assert any("warning" in m for m in msgs)
+    assert resolve_workers(1, msgs.append) == 1
+    for bad in (0, -2, 1.5, True):
+        try:
+            resolve_workers(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted workers = {bad!r}")
+    msgs.clear()
+    entry = {"name": "clamp", "type": "sweep", "n": [10], "K_values": ["n"], "L": 1.0, "repetitions": 2,
+             "max_iterations": 5_000, "seed": 1, "workers": cpus + 3}  # YAML key above the CPU count
+    out = run_experiment(entry, Path(tempfile.mkdtemp()), log=msgs.append)
+    assert (out / "summary.csv").exists() and any("warning" in m for m in msgs)
+    try:
+        parse_experiment({**entry, "workers": 0})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted workers: 0 in an experiment entry")
 
 
 if __name__ == "__main__":

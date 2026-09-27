@@ -1,19 +1,22 @@
 """Experiment types: "trajectory", "sweep" (runtime vs K) and "scaling" (runtime vs n).
 
-The unit of work is ``run_instance(spec) -> RunResult``: one cGA run fully
-determined by an ``InstanceSpec`` (n, K, L, fitness, budget, seed). It has no
-side effects and both arguments and result are picklable, so it can be
-dispatched to a process pool later without restructuring.
+The unit of work is ``run_instance(spec) -> RunResult`` (in cga/instance.py): one
+cGA run fully determined by an ``InstanceSpec`` (n, K, L, fitness, budget, seed).
+It has no side effects and is picklable; with ``workers > 1`` the instances of an
+experiment run on a pool of separate OS processes.
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import multiprocessing
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -21,9 +24,9 @@ import yaml
 
 from . import plotting
 from .analysis import scaling_fits
-from .comparators import make_comparator
 from .expressions import eval_expr
-from .simulator import RunResult, run_cga
+from .instance import InstanceSpec, run_instance, timed_run  # noqa: F401  (re-exported)
+from .simulator import RunResult
 
 # Optional hooks so that a UI can follow progress; the CLI just uses print.
 LogFn = Callable[[str], None]
@@ -35,34 +38,60 @@ def _no_progress(done: int, total: int, message: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Single instance
+# Running instances, sequentially or on a pool of worker processes
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(frozen=True)
-class InstanceSpec:
-    n: int
-    K: float
-    L: float
-    fitness: str
-    max_iterations: int
-    seed: int
-    log_checkpoints: bool = False
+def default_workers() -> int:
+    """Default number of worker processes for the app and the CLI: all CPUs but one."""
+    return max(1, (os.cpu_count() or 2) - 1)
 
 
-def run_instance(spec: InstanceSpec) -> RunResult:
-    """Run one cGA instance. Deterministic given spec (seeded), side-effect free."""
-    rng = np.random.default_rng(spec.seed)
-    comparator = make_comparator(spec.fitness, spec.n, rng)
-    return run_cga(
-        n=spec.n,
-        K=spec.K,
-        L=spec.L,
-        comparator=comparator,
-        max_iterations=spec.max_iterations,
-        rng=rng,
-        log_checkpoints=spec.log_checkpoints,
-    )
+def resolve_workers(requested: int, log: LogFn = print) -> int:
+    """Validate a worker count; values above os.cpu_count() are clamped with a warning."""
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
+        raise ValueError(f"workers must be a positive integer, got {requested!r}")
+    cpus = os.cpu_count() or 1
+    if requested > cpus:
+        log(f"  warning: workers = {requested} exceeds the {cpus} available CPUs; using {cpus}")
+        return cpus
+    return requested
+
+
+def _iter_results(
+    jobs: Sequence[tuple[Any, InstanceSpec]],
+    workers: int,
+    progress: ProgressFn,
+    describe: Callable[[Any], str],
+) -> Iterator[tuple[Any, RunResult, float]]:
+    """Run (tag, spec) jobs and yield (tag, result, wall_seconds) as each one finishes.
+
+    workers == 1 runs in order in this process, exactly as before. workers > 1 uses a pool of
+    separate OS processes (real parallelism; the pure-Python loop is GIL-bound, so threads
+    would not help) and yields in completion order. The caller writes each result to disk as
+    soon as it is yielded, so an interrupted experiment keeps every finished instance.
+    """
+    total = len(jobs)
+    if workers <= 1:
+        for i, (tag, spec) in enumerate(jobs):
+            progress(i, total, f"running {describe(tag)}")
+            yield (tag, *timed_run(spec))
+        return
+    # Largest n first, so the slowest runs do not all start at the end (results do not depend on order).
+    ordered = sorted(jobs, key=lambda job: -job[1].n)
+    # spawn: safe inside a multithreaded host such as the Streamlit server, and the same on every OS.
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+    try:
+        futures = {pool.submit(timed_run, spec): tag for tag, spec in ordered}
+        progress(0, total, f"started {total} runs on {workers} worker processes")
+        for done, fut in enumerate(as_completed(futures), 1):
+            tag = futures[fut]
+            res, wall = fut.result()
+            progress(done, total, f"finished {describe(tag)}")
+            yield tag, res, wall
+    finally:
+        # On interruption (Ctrl-C, Streamlit rerun) drop queued runs instead of waiting for them.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -70,7 +99,8 @@ def run_instance(spec: InstanceSpec) -> RunResult:
 # --------------------------------------------------------------------------- #
 
 _COMMON_REQUIRED = {"name", "type", "L", "repetitions", "max_iterations", "seed"}
-_COMMON_OPTIONAL = {"fitness", "description"}  # description: free text, not used by the simulation
+# description: free text; workers: number of parallel processes. Neither affects the results.
+_COMMON_OPTIONAL = {"fitness", "description", "workers"}
 
 
 def _check_keys(entry: dict, required: set, optional: set) -> None:
@@ -263,6 +293,10 @@ def default_track_indices(n: int) -> list[int]:
 
 def parse_experiment(entry: dict):
     kind = entry.get("type")
+    if "workers" in entry:
+        w = entry["workers"]
+        if isinstance(w, bool) or not isinstance(w, int) or w < 1:
+            raise ValueError(f"experiment '{entry.get('name')}': workers must be a positive integer, got {w!r}")
     if kind == "trajectory":
         return TrajectoryConfig.from_entry(entry)
     if kind == "sweep":
@@ -323,30 +357,35 @@ def run_trajectory(
     plot_only: bool = False,
     log: LogFn = print,
     progress: ProgressFn = _no_progress,
+    workers: int = 1,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    reps = []
+    by_rep: dict[int, dict] = {}
+    todo: list[tuple[int, InstanceSpec]] = []
     for r in range(cfg.repetitions):
-        progress(r, cfg.repetitions, f"repetition {r + 1}/{cfg.repetitions}")
         spec = _trajectory_spec(cfg, r)
         path = out_dir / f"rep_{r:03d}.npz"
         if path.exists() and not fresh:
             rep = load_rep(path)
             if rep["spec"] == asdict(spec):
                 log(f"  rep {r}: loaded from {path.name}")
-                reps.append(rep)
+                by_rep[r] = rep
                 continue
             if plot_only:
                 raise RuntimeError(f"{path} was produced with different parameters; rerun without --plot-only")
         elif plot_only:
             raise RuntimeError(f"{path} does not exist; rerun without --plot-only")
-        t0 = time.perf_counter()
-        res = run_instance(spec)
-        wall = time.perf_counter() - t0
-        _save_rep(path, spec, res, wall)
+        todo.append((r, spec))
+
+    specs = dict(todo)
+    for r, res, wall in _iter_results(todo, workers, progress,
+                                      lambda r: f"repetition {r + 1}/{cfg.repetitions}"):
+        path = out_dir / f"rep_{r:03d}.npz"
+        _save_rep(path, specs[r], res, wall)  # written as soon as it finishes
         status = f"T = {res.runtime}" if res.converged else "not converged"
         log(f"  rep {r}: {status} ({wall:.1f}s)")
-        reps.append(load_rep(path))
+        by_rep[r] = load_rep(path)
+    reps = [by_rep[r] for r in range(cfg.repetitions)]
     progress(cfg.repetitions, cfg.repetitions, "plotting")
 
     summary = trajectory_summary(cfg, reps)
@@ -448,6 +487,7 @@ def _run_grid(
     plot_only: bool,
     log: LogFn,
     progress: ProgressFn,
+    workers: int = 1,
 ) -> pd.DataFrame:
     """Run (or resume) every instance of the grid; write raw_results.csv and summary.csv."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -460,18 +500,17 @@ def _run_grid(
     todo = [t for t in tasks if t.key() not in done]
     if plot_only and todo:
         raise RuntimeError(f"{len(todo)} instances of '{cfg.name}' have no results yet; rerun without --plot-only")
-    log(f"  {len(tasks)} instances, {len(tasks) - len(todo)} already done, {len(todo)} to run")
+    log(f"  {len(tasks)} instances, {len(tasks) - len(todo)} already done, {len(todo)} to run"
+        + (f" on {workers} worker processes" if workers > 1 and todo else ""))
 
     new_file = not raw_path.exists()
     with raw_path.open("a", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=RAW_COLUMNS)
         if new_file:
             writer.writeheader()
-        for i, task in enumerate(todo, 1):
-            progress(i - 1, len(todo), f"n={task.spec.n}, K={task.K_expr}, rep {task.repetition}")
-            t0 = time.perf_counter()
-            res = run_instance(task.spec)
-            wall = time.perf_counter() - t0
+        jobs = [(task, task.spec) for task in todo]
+        describe = lambda t: f"n={t.spec.n}, K={t.K_expr}, rep {t.repetition}"  # noqa: E731
+        for i, (task, res, wall) in enumerate(_iter_results(jobs, workers, progress, describe), 1):
             s = task.spec
             writer.writerow({
                 "n": s.n, "K_expr": task.K_expr, "K": repr(s.K), "L": repr(s.L),
@@ -503,8 +542,9 @@ def run_sweep(
     plot_only: bool = False,
     log: LogFn = print,
     progress: ProgressFn = _no_progress,
+    workers: int = 1,
 ) -> None:
-    summary = _run_grid(cfg, out_dir, fresh, plot_only, log, progress)
+    summary = _run_grid(cfg, out_dir, fresh, plot_only, log, progress, workers)
     plotting.plot_sweep(cfg, summary, out_dir)
 
 
@@ -515,8 +555,9 @@ def run_scaling(
     plot_only: bool = False,
     log: LogFn = print,
     progress: ProgressFn = _no_progress,
+    workers: int = 1,
 ) -> None:
-    summary = _run_grid(cfg, out_dir, fresh, plot_only, log, progress)
+    summary = _run_grid(cfg, out_dir, fresh, plot_only, log, progress, workers)
     fits = scaling_fits(summary, cfg.K_exprs)
     fits.to_csv(out_dir / "scaling_fits.csv", index=False)
     for f in fits.itertuples(index=False):
@@ -583,13 +624,20 @@ def run_experiment(
     plot_only: bool = False,
     log: LogFn = print,
     progress: ProgressFn = _no_progress,
+    workers: Optional[int] = None,
 ) -> Path:
-    """Run one config entry; returns the directory holding its results and plots."""
+    """Run one config entry; returns the directory holding its results and plots.
+
+    workers: number of parallel processes. None means the entry's own `workers` key, or 1
+    (sequential) if it has none; an explicit value overrides the entry. Values above
+    os.cpu_count() are clamped with a warning. The results do not depend on it.
+    """
     cfg = parse_experiment(entry)
     out_dir = results_root / cfg.name
     log(f"=== {cfg.name} ({entry['type']}) -> {out_dir}")
+    workers = resolve_workers(entry.get("workers", 1) if workers is None else workers, log)
     runner = {TrajectoryConfig: run_trajectory, SweepConfig: run_sweep, ScalingConfig: run_scaling}[type(cfg)]
-    runner(cfg, out_dir, fresh=fresh, plot_only=plot_only, log=log, progress=progress)
+    runner(cfg, out_dir, fresh=fresh, plot_only=plot_only, log=log, progress=progress, workers=workers)
     # The exact entry (including any description), so results can be traced back and rerun.
     (out_dir / "experiment.yaml").write_text(
         yaml.safe_dump({"experiments": [entry]}, sort_keys=False, allow_unicode=True))

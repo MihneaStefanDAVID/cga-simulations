@@ -5,6 +5,7 @@
     python run_experiments.py example_small       # only the experiment with that name
     python run_experiments.py --plot-only         # replot from saved data, no simulation
     python run_experiments.py NAME --fresh        # discard saved results for NAME and rerun
+    python run_experiments.py --workers 4         # run instances on 4 parallel processes
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import yaml
 
-from cga.experiments import parse_experiment, run_experiment
+from cga.experiments import default_workers, parse_experiment, run_experiment
 
 HERE = Path(__file__).resolve().parent
 
@@ -27,6 +28,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--results", type=Path, default=HERE / "results", help="output root directory")
     ap.add_argument("--fresh", action="store_true", help="ignore and overwrite previously saved results")
     ap.add_argument("--plot-only", action="store_true", help="only replot from saved results")
+    ap.add_argument("--workers", type=int, default=None, metavar="N",
+                    help="parallel worker processes (separate OS processes, not threads). Default: the "
+                         f"experiment's own `workers` key if set, else CPUs - 1 (= {default_workers()} here). "
+                         "Values above the CPU count are clamped. Results do not depend on it.")
     args = ap.parse_args(argv)
 
     with args.config.open() as fh:
@@ -47,8 +52,11 @@ def main(argv: list[str] | None = None) -> int:
         if not entries:
             ap.error(f"no experiment named '{args.name}' in {args.config}; available: {names}")
 
+    if args.workers is not None and args.workers < 1:
+        ap.error("--workers must be at least 1")
     for entry in entries:
-        run_experiment(entry, args.results, fresh=args.fresh, plot_only=args.plot_only)
+        workers = args.workers if args.workers is not None else entry.get("workers", default_workers())
+        run_experiment(entry, args.results, fresh=args.fresh, plot_only=args.plot_only, workers=workers)
     return 0
 
 

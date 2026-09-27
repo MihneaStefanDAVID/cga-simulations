@@ -152,6 +152,12 @@ input has a help tooltip.
 | ![Scaling results](docs/images/ui_results_scaling.png) | ![Load from file](docs/images/ui_load.png) |
 | **Scaling results.** A table of the fitted exponents, then the log-log plot, the normalized plot and the summary table. | **Load from file.** Upload a YAML experiment file (a commented template is included) or use `experiments.yaml`. Every entry is validated and summarized, and you choose which ones to run. |
 
+**Parallel workers.** Every experiment form has a *Parallel workers* field next to *Repetitions*.
+It sets how many separate OS processes run the repetitions at the same time; the default is all
+CPUs but one. Opening a second browser tab of the app does **not** add parallelism, because both
+tabs share one Python process. To run two experiments fully independently, start the second one
+from a terminal with `run_experiments.py`.
+
 **Saving is manual.** A run started in the app is a temporary draft. Below its results, a
 **Save** panel asks for a **name** and a **description**, for example what the experiment is for or
 what you observed. Saving stores everything in `results/<name>/`. You can also **discard** the run,
@@ -198,6 +204,7 @@ python3 run_experiments.py NAME              # run only the experiment called NA
 python3 run_experiments.py --config my.yaml  # use another experiment file
 python3 run_experiments.py --plot-only       # replot from saved data, no simulation
 python3 run_experiments.py NAME --fresh      # discard NAME's saved results and rerun
+python3 run_experiments.py --workers 8       # 8 parallel worker processes (default: CPUs - 1)
 ```
 
 An experiment file is a list under `experiments:`. The commented template
@@ -266,13 +273,24 @@ budget, and it is defined whenever more than half of the runs finished.
   borders, and ties leaving p unchanged. Further tests cover the budget cap, reproducibility from
   the seed, and frequencies staying within the borders.
 - **The fitness function is pluggable.** The core loop only calls `comparator(X, Y) -> (winner,
-  loser) | None`. OneMax and Dynamic BinVal are registered as stubs, ready to be implemented.
+  loser) | None`. Other fitness functions are added as comparators in `cga/comparators.py`.
 - **Speed.** The loop is vectorized over bits with numpy and costs about 5 µs per iteration at
   n = 200 and 12 µs at n = 1000. A run of 2·10⁶ iterations takes roughly 10–25 s.
-- **Resumable.** Sweeps save every finished run immediately and skip finished runs when restarted,
-  so an interrupted sweep continues where it stopped, and adding K values only runs the new ones.
-  Each run is a single side-effect-free function, `run_instance(spec)`, which makes adding
-  multiprocessing straightforward.
+- **Parallel.** Each run is a single side-effect-free function, `run_instance(spec)` in
+  `cga/instance.py`. With `workers > 1`, the runs of an experiment execute on a pool of separate
+  OS processes (`ProcessPoolExecutor`, spawn start method). They are processes, not threads: the
+  simulation is pure Python and holds the GIL, so threads, or two browser tabs of the same app,
+  would only take turns on one core. The number of workers comes from the app's
+  **Parallel workers** field, or `--workers N` on the command line, or an optional `workers:` key in
+  the experiment file (in that order of precedence). The default is all CPUs but one, and values
+  above the CPU count are capped. **Results do not depend on it:** the tests check that parallel and
+  sequential runs produce identical rows. On a Mac with 4 performance and 6 efficiency cores, 8
+  workers ran a sweep about 3.6× faster.
+- **Resumable.** Every finished run is written to disk immediately, to `raw_results.csv` or
+  `rep_XXX.npz`, including in parallel mode, where results arrive in completion order. When
+  restarted, finished runs are skipped. An interrupted experiment therefore continues where it
+  stopped, and adding K values only runs the new ones. On Ctrl-C, or when an input changes in the
+  app, queued runs are cancelled instead of awaited.
 - **Seeding.** Repetition r uses seed + r for every n and K (common random numbers across K). Every
   run can be reproduced from its seed.
 
@@ -281,6 +299,7 @@ budget, and it is defined whenever more than half of the runs finished.
 ```
 cga/
   simulator.py      the cGA loop: run_cga(n, K, L, comparator, max_iterations, rng, log_checkpoints)
+  instance.py       one run as a unit of work: InstanceSpec, run_instance() (what worker processes run)
   comparators.py    BinVal comparator and the registry for other fitness functions
   experiments.py    config parsing, run_instance(), trajectory / sweep / scaling drivers (resumable)
   plotting.py       all figures

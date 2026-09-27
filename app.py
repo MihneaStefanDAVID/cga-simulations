@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import shutil
 import time
@@ -22,8 +23,8 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-from cga.experiments import (ScalingConfig, SweepConfig, TrajectoryConfig, default_track_indices, geometric_ns,
-                             parse_experiment, run_experiment)
+from cga.experiments import (ScalingConfig, SweepConfig, TrajectoryConfig, default_track_indices, default_workers,
+                             geometric_ns, parse_experiment, run_experiment)
 from cga.expressions import eval_expr
 from cga.simulator import borders
 
@@ -37,7 +38,6 @@ DRAFT_MAX_AGE_DAYS = 7
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 IMPLEMENTED_FITNESS = ["binval"]  # other comparators are registered as stubs in cga/comparators.py
 
-st.set_page_config(page_title="cGA simulator", page_icon="🧬", layout="wide")
 
 # --------------------------------------------------------------------------- #
 # Widget state: defaults live in session_state so values survive mode switches
@@ -75,11 +75,20 @@ DEFAULTS = {
     "sc_fitness": "binval",
     "sc_norm": "n*log(n)",
     "sc_export_name": "my_scaling",
+    "tr_workers": default_workers(),
+    "sw_workers": default_workers(),
+    "sc_workers": default_workers(),
+    "lf_workers": default_workers(),
 }
-for key, value in DEFAULTS.items():
-    st.session_state.setdefault(key, value)
-    # Re-assigning keeps Streamlit from dropping the value while the widget is not shown.
-    st.session_state[key] = st.session_state[key]
+CPUS = os.cpu_count() or 1
+WORKERS_HELP = (
+    f"Number of separate OS processes that run repetitions in parallel (this machine has {CPUS} CPUs; "
+    "higher values are capped). They are processes, not threads: the simulation is pure Python and holds "
+    "the GIL, so threads would not run in parallel. Opening a second browser tab of this app does NOT "
+    "parallelize either (same Python process, same GIL); use this control instead, or start a second "
+    "experiment from a separate terminal with `python run_experiments.py` for a fully independent process. "
+    "The results are identical for any number of workers."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,12 +113,14 @@ def fmt_duration(seconds: float) -> str:
     return f"{seconds / 86400:.1f} days"
 
 
-def worst_case_seconds(cfg) -> float:
-    """Upper bound: every run uses its whole budget."""
+def worst_case_seconds(cfg, workers: int = 1) -> float:
+    """Rough upper bound: every run uses its whole budget, spread over the usable worker processes."""
     if isinstance(cfg, TrajectoryConfig):
-        return cfg.repetitions * cfg.max_iterations * us_per_iteration(cfg.n) * 1e-6
-    per_n = sum(us_per_iteration(n) for n in cfg.ns)
-    return len(cfg.K_exprs) * cfg.repetitions * cfg.max_iterations * per_n * 1e-6
+        runs, total = cfg.repetitions, cfg.repetitions * cfg.max_iterations * us_per_iteration(cfg.n) * 1e-6
+    else:
+        runs = len(cfg.ns) * len(cfg.K_exprs) * cfg.repetitions
+        total = len(cfg.K_exprs) * cfg.repetitions * cfg.max_iterations * sum(us_per_iteration(n) for n in cfg.ns) * 1e-6
+    return total / max(1, min(workers, CPUS, runs))
 
 
 def entry_yaml(entry: dict) -> str:
@@ -138,7 +149,7 @@ def validate(entry: dict):
         return None, str(exc).replace(f"experiment '{DRAFT_NAME}': ", "")
 
 
-def run_with_ui(entry: dict, results_root: Path, label: str) -> Path | None:
+def run_with_ui(entry: dict, results_root: Path, label: str, workers: int = 1) -> Path | None:
     """Run one experiment with a progress bar and a live log. Returns the results folder."""
     log_lines: list[str] = []
     with st.status(f"Running **{label}** …", expanded=True) as status:
@@ -152,11 +163,11 @@ def run_with_ui(entry: dict, results_root: Path, label: str) -> Path | None:
 
         def progress(done: int, total: int, message: str) -> None:
             frac = done / total if total else 1.0
-            bar.progress(min(frac, 1.0), text=f"{done}/{total} done · now: {message} · "
+            bar.progress(min(frac, 1.0), text=f"{done}/{total} done · {message} · "
                                               f"elapsed {fmt_duration(time.perf_counter() - t0)}")
 
         try:
-            out_dir = run_experiment(entry, results_root, log=log, progress=progress)
+            out_dir = run_experiment(entry, results_root, log=log, progress=progress, workers=workers)
         except Exception as exc:
             status.update(label=f"**{label}** failed: {exc}", state="error")
             return None
@@ -166,18 +177,18 @@ def run_with_ui(entry: dict, results_root: Path, label: str) -> Path | None:
 
 
 def _core(entry: dict) -> dict:
-    """The settings that determine the simulation (everything except name and description)."""
-    return {k: v for k, v in entry.items() if k not in ("name", "description")}
+    """The settings that determine the simulation (everything except name, description and workers)."""
+    return {k: v for k, v in entry.items() if k not in ("name", "description", "workers")}
 
 
-def run_draft(entry: dict, label: str) -> dict | None:
+def run_draft(entry: dict, label: str, workers: int = 1) -> dict | None:
     """Run an experiment as an unsaved draft. Returns a run record for show_run(), or None on failure.
 
     The draft folder is keyed by the settings, so rerunning identical settings continues an
     interrupted run instead of starting over (runs are deterministic given the seed).
     """
     key = hashlib.sha1(json.dumps(_core(entry), sort_keys=True).encode()).hexdigest()[:12]
-    out = run_with_ui({"name": DRAFT_NAME, **_core(entry)}, DRAFTS / key, label)
+    out = run_with_ui({"name": DRAFT_NAME, **_core(entry)}, DRAFTS / key, label, workers)
     if out is None:
         return None
     return {"id": f"{key}_{time.time_ns()}", "dir": str(out), "entry": entry, "saved": None}
@@ -508,6 +519,7 @@ def page_trajectory() -> None:
         st.number_input("L — border factor", key="tr_L", min_value=0.01, step=0.05, format="%.3f",
                         help="Borders l = 1/(L·n), u = 1 − l. L = 1: standard borders.")
         st.number_input("Repetitions", key="tr_reps", min_value=1, step=1)
+        st.number_input("Parallel workers", key="tr_workers", min_value=1, step=1, help=WORKERS_HELP)
         st.number_input("max_iterations — budget per run", key="tr_maxit", min_value=1, step=50_000,
                         help="A run that has not sampled the optimum by then is recorded as not converged.")
     with c3:
@@ -550,8 +562,9 @@ def page_trajectory() -> None:
         m[1].metric("Step size 1/K", f"{1 / cfg.K:.4g}")
         m[2].metric("Lower border l", f"{lo:.4g}", help="1/(L·n)")
         m[3].metric("Upper border u", f"{hi:.4g}", help="1 − 1/(L·n)")
-        m[4].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg)),
-                    help="Rough estimate if every run uses its full budget. Runs that converge earlier are faster.")
+        m[4].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg, int(ss.tr_workers))),
+                    help="Rough estimate if every run uses its full budget, divided over the parallel workers. "
+                         "Runs that converge earlier are faster.")
         st.caption(f"Tracked bits: {', '.join(map(str, cfg.track_indices))} · "
                    f"checkpoints per run: about {int(math.log2(cfg.max_iterations)) + 2} "
                    f"(t = 0, 1, 2, 4, …, {2 ** int(math.log2(cfg.max_iterations)):,})")
@@ -562,7 +575,7 @@ def page_trajectory() -> None:
                "Changing any input while a run is going stops it; running the same settings again continues "
                "where it stopped.")
     if st.button("▶ Run trajectory experiment", type="primary", disabled=bool(error)):
-        run = run_draft(_core(entry), "trajectory experiment")
+        run = run_draft(_core(entry), "trajectory experiment", int(ss.tr_workers))
         if run:
             ss.tr_run = run
     if ss.get("tr_run"):
@@ -596,6 +609,7 @@ def page_sweep() -> None:
                      help="Each expression is evaluated separately for every n. log is the natural log.")
     with c3:
         st.number_input("Repetitions per (n, K)", key="sw_reps", min_value=1, step=1)
+        st.number_input("Parallel workers", key="sw_workers", min_value=1, step=1, help=WORKERS_HELP)
         st.number_input("max_iterations — budget per run", key="sw_maxit", min_value=1, step=50_000)
         st.number_input("Seed", key="sw_seed", step=1,
                         help="Repetition r uses seed + r, for every n and K (common random numbers).")
@@ -636,8 +650,8 @@ def page_sweep() -> None:
         m[0].metric("Runs in total", f"{len(cfg.ns) * len(cfg.K_exprs) * cfg.repetitions:,}",
                     help="n values × K values × repetitions")
         m[1].metric("Budget per run", f"{cfg.max_iterations:,}")
-        m[2].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg)),
-                    help="Rough estimate if every run uses its full budget.")
+        m[2].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg, int(ss.sw_workers))),
+                    help="Rough estimate if every run uses its full budget, divided over the parallel workers.")
         config_actions(_core(entry), "sw")
 
     st.subheader("Run")
@@ -645,7 +659,7 @@ def page_sweep() -> None:
                "Changing any input while a run is going stops it; running the same settings again continues "
                "where it stopped.")
     if st.button("▶ Run sweep", type="primary", disabled=bool(error)):
-        run = run_draft(_core(entry), "sweep")
+        run = run_draft(_core(entry), "sweep", int(ss.sw_workers))
         if run:
             ss.sw_run = run
     if ss.get("sw_run"):
@@ -691,6 +705,7 @@ def page_scaling() -> None:
                       help="Adds a plot of T / f(n). Leave empty to skip. Examples: n*log(n), n**1.5, n**2.")
     with c3:
         st.number_input("Repetitions per (n, K)", key="sc_reps", min_value=1, step=1)
+        st.number_input("Parallel workers", key="sc_workers", min_value=1, step=1, help=WORKERS_HELP)
         st.number_input("max_iterations — budget per run", key="sc_maxit", min_value=1, step=100_000,
                         help="Must be large enough for the largest n; otherwise those points drop out of the fit.")
         st.number_input("Seed", key="sc_seed", step=1, help="Repetition r uses seed + r, for every n and K.")
@@ -739,8 +754,9 @@ def page_scaling() -> None:
         m[0].metric("Runs in total", f"{len(cfg.ns) * len(cfg.K_exprs) * cfg.repetitions:,}",
                     help="n values × K formulas × repetitions")
         m[1].metric("Budget per run", f"{cfg.max_iterations:,}")
-        m[2].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg)),
-                    help="Rough estimate if every run uses its full budget. Dominated by the largest n.")
+        m[2].metric("Worst-case time", fmt_duration(worst_case_seconds(cfg, int(ss.sc_workers))),
+                    help="Rough estimate if every run uses its full budget, divided over the parallel workers. "
+                         "Dominated by the largest n.")
         if len(cfg.ns) < 4:
             st.warning(f"Only {len(cfg.ns)} values of n. Exponents fitted from so few points are unreliable (two "
                        "points always fit perfectly). Four or more, spread over at least a factor of 8 in n, "
@@ -752,7 +768,7 @@ def page_scaling() -> None:
                "Changing any input while a run is going stops it; running the same settings again continues "
                "where it stopped.")
     if st.button("▶ Run scaling experiment", type="primary", disabled=bool(error)):
-        run = run_draft(_core(entry), "scaling experiment")
+        run = run_draft(_core(entry), "scaling experiment", int(ss.sc_workers))
         if run:
             ss.sc_run = run
     if ss.get("sc_run"):
@@ -827,7 +843,10 @@ def page_load() -> None:
         overview.insert(1, "description", descriptions)
     st.dataframe(overview, hide_index=True)
     chosen = st.multiselect("Experiments to run", list(parsed), default=list(parsed))
-    total = sum(worst_case_seconds(parsed[n][1]) for n in chosen)
+    st.number_input("Parallel workers (for experiments whose file sets no `workers`)", key="lf_workers",
+                    min_value=1, step=1, help=WORKERS_HELP)
+    total = sum(worst_case_seconds(parsed[n][1], int(parsed[n][0].get("workers", st.session_state.lf_workers)))
+                for n in chosen)
     st.caption(f"Worst-case total time: {fmt_duration(total)} (rough estimate, every run using its full budget). "
                "Results are not saved automatically: each one gets its own Save panel, with the name and description "
                "from the file filled in.")
@@ -835,7 +854,8 @@ def page_load() -> None:
     if st.button("▶ Run selected", type="primary", disabled=not chosen):
         runs = []
         for name in chosen:
-            run = run_draft(parsed[name][0], name)
+            run = run_draft(parsed[name][0], name,
+                            int(parsed[name][0].get("workers", st.session_state.lf_workers)))
             if run:
                 runs.append(run)
         st.session_state.lf_runs = runs
@@ -884,18 +904,32 @@ PAGES = {
     "Browse results": (page_browse, "reopen saved experiments"),
 }
 
-# Optional URL parameters: ?mode=Sweep or ?mode=Browse+results&exp=<name> (applied on first load only).
-if "url_applied" not in st.session_state:
-    st.session_state.url_applied = True
-    prune_old_drafts()
-    if st.query_params.get("mode") in PAGES:
-        st.session_state.mode = st.query_params["mode"]
 
-with st.sidebar:
-    st.header("🧬 cGA simulator")
-    mode = st.radio("Mode", list(PAGES), captions=[c for _, c in PAGES.values()], key="mode")
-    st.divider()
-    st.caption("Runs are drafts until you save them. Saved experiments go to `results/<name>/` in the project "
-               "folder and appear under *Browse results*, together with experiments run from the terminal.")
+def main() -> None:
+    st.set_page_config(page_title="cGA simulator", page_icon="🧬", layout="wide")
+    for key, value in DEFAULTS.items():
+        st.session_state.setdefault(key, value)
+        # Re-assigning keeps Streamlit from dropping the value while the widget is not shown.
+        st.session_state[key] = st.session_state[key]
 
-PAGES[mode][0]()
+    # Optional URL parameters: ?mode=Sweep or ?mode=Browse+results&exp=<name> (applied on first load only).
+    if "url_applied" not in st.session_state:
+        st.session_state.url_applied = True
+        prune_old_drafts()
+        if st.query_params.get("mode") in PAGES:
+            st.session_state.mode = st.query_params["mode"]
+
+    with st.sidebar:
+        st.header("🧬 cGA simulator")
+        mode = st.radio("Mode", list(PAGES), captions=[c for _, c in PAGES.values()], key="mode")
+        st.divider()
+        st.caption("Runs are drafts until you save them. Saved experiments go to `results/<name>/` in the project "
+                   "folder and appear under *Browse results*, together with experiments run from the terminal.")
+
+    PAGES[mode][0]()
+
+
+# Streamlit runs this script as __main__. Worker processes (spawn) import it as __mp_main__ and must
+# not build the UI, so everything that draws or touches session state lives in main().
+if __name__ == "__main__":
+    main()

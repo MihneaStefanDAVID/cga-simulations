@@ -1,0 +1,27 @@
+# cGA experiments. Run with: python run_experiments.py [name]
+# Expressions (K, K_values) may use n and: log (natural), ln, log2, log10, sqrt, exp,
+# floor, ceil, min, max, pi, e. Borders: l = 1/(L*n), u = 1 - l.
+# The two entries below are small smoke tests, not scientifically chosen settings.
+
+experiments:
+  - name: example_small
+    type: trajectory
+    fitness: binval          # optional, default binval
+    n: 30
+    K: "5 * log(n)"
+    L: 1.0
+    repetitions: 5
+    max_iterations: 20000
+    seed: 42                 # repetition r uses seed + r
+    # track_indices: [1, 2, 3, 5, 10, 7, 15, 30]   # optional, 1-based; default {1,2,3,5,10,n//4,n//2,n}
+    # heatmap_repetition: 0                         # optional, which repetition the heatmap shows
+
+  - name: k_sweep_example
+    type: sweep
+    fitness: binval
+    n: [20, 40]
+    K_values: ["2*log(n)", "5*log(n)", "sqrt(n*log(n))", "n"]
+    L: 1.0
+    repetitions: 5
+    max_iterations: 4000     # low on purpose, so some n=40 runs fail and the success panel is exercised
+    seed: 42                 # repetition r uses seed + r (for every n and K)

@@ -1,0 +1,61 @@
+# ============================================================================
+# cGA experiment file — TEMPLATE
+# ============================================================================
+# Copy this file, edit it, then either
+#   * upload it in the UI (mode "Load from file"), or
+#   * run it from the terminal:  python run_experiments.py --config my_file.yaml
+#
+# A file holds a list of experiments under the key `experiments:`.
+# Each experiment has a unique `name`; its results go to results/<name>/.
+#
+# Expressions (for K and K_values) are Python expressions in the variable n.
+# Allowed names: log (natural log), ln, log2, log10, sqrt, exp, floor, ceil,
+# min, max, pi, e.   Examples: "5*log(n)", "sqrt(n*log(n))", "0.3*n", 50
+#
+# The algorithm (for reference):
+#   p_i = 1/2 for all i. Each iteration: sample X, Y ~ p; if X or Y = 11...1,
+#   stop (runtime T = this iteration). Otherwise the fitter one (BinVal =
+#   first differing bit decides) is the winner W, the other the loser; for each
+#   bit where they differ, move p_i by 1/K toward the winner's bit; clip p to
+#   [1/(L n), 1 - 1/(L n)]. X == Y means no update.
+# ============================================================================
+
+experiments:
+
+  # --------------------------------------------------------------------------
+  # TYPE "trajectory": one (n, K, L) setting, frequencies studied over time.
+  # Output: heatmap of p_{i,t}, trajectories of selected bits, runtime summary.
+  # --------------------------------------------------------------------------
+  - name: my_trajectory          # unique; results/my_trajectory/
+    type: trajectory
+    fitness: binval              # optional (default binval); only binval is implemented so far
+    n: 100                       # number of bits
+    K: "5 * log(n)"              # hypothetical population size; step size is 1/K
+    L: 1.0                       # border factor: l = 1/(L*n), u = 1 - l  (L = 1: standard borders)
+    repetitions: 5               # independent runs
+    max_iterations: 200000       # budget per run; runs that hit it count as "not converged"
+    seed: 42                     # repetition r uses seed + r
+    # --- optional ---
+    # track_indices: [1, 2, 3, 5, 10, 25, 50, 100]   # 1-based bits for the trajectory plot
+    #                                                 # default: 1, 2, 3, 5, 10, n//4, n//2, n
+    # heatmap_repetition: 0                           # which repetition the heatmap shows (0-based)
+
+  # --------------------------------------------------------------------------
+  # TYPE "sweep": runtime as a function of K, for one or more n.
+  # Every (n, K value, repetition) is one independent run; only T is recorded.
+  # Output: runtime-vs-K plot per n (median, 10–90% band, mean, success rate),
+  #         raw_results.csv and summary.csv.
+  # --------------------------------------------------------------------------
+  - name: my_sweep
+    type: sweep
+    fitness: binval
+    n: [50, 100]                 # one number or a list
+    K_values:                    # expressions in n, evaluated separately for every n
+      - "2*log(n)"
+      - "5*log(n)"
+      - "sqrt(n*log(n))"
+      - "n"
+    L: 1.0
+    repetitions: 10
+    max_iterations: 200000
+    seed: 42                     # repetition r uses seed + r (for every n and every K)

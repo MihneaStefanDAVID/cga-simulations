@@ -12,6 +12,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from . import kernel
 from .comparators import make_comparator
 from .simulator import RunResult, run_cga
 
@@ -30,9 +31,15 @@ class InstanceSpec:
 def run_instance(spec: InstanceSpec, on_progress: Optional[Callable[[int], None]] = None) -> RunResult:
     """Run one cGA instance. Deterministic given spec (seeded), side-effect free, picklable.
 
+    Uses the C++ kernel when available (identical results, faster); see cga/kernel.
     on_progress(iterations_done) is called periodically during the run (display only)."""
     rng = np.random.default_rng(spec.seed)
-    comparator = make_comparator(spec.fitness, spec.n, rng)
+    comparator = make_comparator(spec.fitness, spec.n, rng)  # also rejects unimplemented fitness functions
+    if kernel.engine_for(spec.fitness) == "cpp":
+        return kernel.run_cga_cpp(
+            n=spec.n, K=spec.K, L=spec.L, fitness=spec.fitness, max_iterations=spec.max_iterations, rng=rng,
+            log_checkpoints=spec.log_checkpoints, on_progress=on_progress,
+        )
     return run_cga(
         n=spec.n,
         K=spec.K,

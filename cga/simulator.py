@@ -38,6 +38,19 @@ def borders(n: int, L: float) -> tuple[float, float]:
     return lo, 1.0 - lo
 
 
+def validate_params(n: int, K: float, L: float, max_iterations: int) -> None:
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    if not K > 0:
+        raise ValueError(f"K must be positive, got {K}")
+    if not L > 0:
+        raise ValueError(f"L must be positive, got {L}")
+    if L < 1:
+        warnings.warn(f"L = {L} < 1: the lower border 1/(L n) is wider than the standard 1/n")
+    if max_iterations < 1:
+        raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
+
+
 def run_cga(
     n: int,
     K: float,
@@ -58,17 +71,7 @@ def run_cga(
     on_progress(t), if given, is called every `progress_every` iterations with the number of
     iterations done so far (for live progress displays; it does not affect the run).
     """
-    if n < 1:
-        raise ValueError(f"n must be >= 1, got {n}")
-    if not K > 0:
-        raise ValueError(f"K must be positive, got {K}")
-    if not L > 0:
-        raise ValueError(f"L must be positive, got {L}")
-    if L < 1:
-        warnings.warn(f"L = {L} < 1: the lower border 1/(L n) is wider than the standard 1/n")
-    if max_iterations < 1:
-        raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
-
+    validate_params(n, K, L, max_iterations)
     lo, hi = borders(n, L)
     step = 1.0 / K
     p = np.full(n, 0.5)

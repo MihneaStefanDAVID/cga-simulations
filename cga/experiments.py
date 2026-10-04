@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from . import plotting
+from . import kernel, plotting
 from .analysis import scaling_fits
 from .expressions import eval_expr
 from .instance import SLOT_FIELDS, InstanceSpec, init_worker, run_instance, timed_run  # noqa: F401  (re-exported)
@@ -112,6 +112,7 @@ def _iter_results(
                                    f"({100 * t / budget:.0f}% of budget)")
             yield (tag, *timed_run(spec, live))
         return
+    kernel.available()  # build the C++ kernel once here, instead of in every worker at the same time
     ctx = multiprocessing.get_context("spawn")  # safe inside a multithreaded host such as the Streamlit server
     shared = ctx.RawArray("d", SLOT_FIELDS * workers)  # live (n, iterations, budget); one writer per slot
     counter = ctx.Value("i", 0)

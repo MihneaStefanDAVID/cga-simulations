@@ -79,7 +79,7 @@ recorded as *not converged*.
 
 ## What the simulator measures
 
-There are three experiment types. Each can be set up in a YAML file or in the app.
+There are three experiment types, which can be set up in a YAML file or in the app, plus live runs.
 
 ### 1. Trajectory: one setting, followed over time
 
@@ -138,6 +138,32 @@ out of the fit. The exponents are also saved in `scaling_fits.csv`. Treat $b$ as
 several $n$ values over a reasonable range: two points always fit a line perfectly, and the plot
 says so when that happens.
 
+### 4. Live: watch one long run as it happens
+
+For runs that take hours or days, the **Live** page starts a single run in a background process and
+shows it while it runs. Each frequency vector is a row of colours (bit 1 on the left, orange = 0,
+grey = ½, blue = 1), and time flows downward:
+
+<p align="center">
+  <img src="docs/images/ui_live.png" width="820" alt="The Live page">
+  <br><em>A live run (n = 400, K = 5 ln n, L = 1) after 24 million iterations: the current row, the cascade of recent rows, and the whole run so far.</em>
+</p>
+
+Memory stays at a few MB however long the run takes, because nothing is stored per iteration:
+- **Now:** the current frequencies, refreshed a few times per second.
+- **Cascade:** the most recent rows, one every *k* iterations; *k* adapts to the chosen number of
+  rows per second.
+- **Whole run:** at most about 2000 rows at evenly spaced times. When it is full, every other row is
+  dropped and the spacing doubles, so it always covers t = 0 to now.
+- **Log time:** rows at t = 1, 2, 3, … and then 8 per doubling, so the early phase stays visible.
+- **Front:** the number of leading bits at the upper border, plus the number of bits at each border,
+  as curves over time.
+
+The runner is independent of the browser and of the app: it keeps going when they are closed. Its
+exact state (frequencies and random-number state) is saved every minute and on Stop, and **Resume**
+continues exactly as if the run had never been interrupted. A test checks that a stopped and
+resumed live run ends with the same runtime as an uninterrupted one.
+
 ## The app
 
 `streamlit run app.py` opens a local web app. Everything is explained on the page itself, and every
@@ -175,7 +201,8 @@ from the app or from the terminal, with its description and exact configuration.
 
 ## Quick start
 
-Requires Python 3.10 or newer.
+Requires Python 3.10 or newer, and a C++ compiler for the fast engine (on macOS:
+`xcode-select --install`; without one, everything still works, just slower).
 
 ```bash
 git clone https://github.com/MihneaStefanDAVID/cga-simulations.git
@@ -258,6 +285,7 @@ configuration including the description, so it can be traced back and rerun.
 | **trajectory** | `heatmap.png/.pdf` and `trajectories.png/.pdf` (the plots); `summary.txt`/`.json` (converged count, min/median/max runtime); `rep_XXX.npz` (per repetition: checkpoint times, the frequency matrix, the runtime, and the exact parameters used) |
 | **sweep** | `runtime_vs_K_n<n>.png/.pdf` (one figure per n); `runtime_vs_n.png/.pdf` (only when the sweep has ≥ 2 values of n); `raw_results.csv` (one row per run: n, K, seed, converged, runtime, wall time, …); `summary.csv` (per (n, K): success rate, min/p10/median/p90/max/mean runtime, and `median_censored`) |
 | **scaling** | `runtime_vs_n.png/.pdf` (log-log with fitted power laws); `runtime_normalized.png/.pdf` (if `normalize_by` is set); `scaling_fits.csv` (per K formula: exponent b, prefactor c, R², which n values were used); `raw_results.csv` and `summary.csv` as for a sweep |
+| **live** (in `results/.live/<id>/`) | `meta.json` (parameters), `live.bin` (memory-mapped store of fixed size: current row, cascade, compacted history, log-time history, metrics), `checkpoint.json` + `checkpoint_p.npy` (exact state for resuming), `runner.log` |
 
 The PDFs are there to go straight into LaTeX. `median_censored` is the median over *all* runs, with
 unfinished runs counted as +∞. Unlike the median over successful runs, it is not biased by the
@@ -274,8 +302,24 @@ budget, and it is defined whenever more than half of the runs finished.
   the seed, and frequencies staying within the borders.
 - **The fitness function is pluggable.** The core loop only calls `comparator(X, Y) -> (winner,
   loser) | None`. Other fitness functions are added as comparators in `cga/comparators.py`.
-- **Speed.** The loop is vectorized over bits with numpy and costs about 5 µs per iteration at
-  n = 200 and 12 µs at n = 1000. A run of 2·10⁶ iterations takes roughly 10–25 s.
+- **Fast C++ engine, identical results.** By default every run uses a C++ kernel
+  (`cga/kernel/cga_kernel.cpp`). It reproduces numpy's random-number stream exactly (PCG64, the
+  generator behind `np.random.default_rng`) and performs the same floating-point operations, so for
+  the same seed it gives **bit-for-bit the same results** as the Python simulator: the same runtime
+  and the same frequency vectors at every checkpoint. The tests check this for BinVal and OneMax. It
+  is compiled automatically on first use, which needs a C++ compiler (on macOS:
+  `xcode-select --install`); without one, the Python implementation is used. `CGA_ENGINE=python`
+  forces Python, and `CGA_ENGINE=cpp` requires C++. Measured time per iteration:
+
+  | n | Python | C++ | speedup |
+  |---|---|---|---|
+  | 50 | 4.3 µs | 0.08 µs | 52× |
+  | 200 | 5.5 µs | 0.32 µs | 17× |
+  | 1280 | 13.8 µs | 2.0 µs | 6.8× |
+  | 5000 | 40.5 µs | 8.5 µs | 4.8× |
+
+  At large n most of the remaining time is spent generating random numbers, which is the price of
+  staying identical to numpy.
 - **Parallel.** Each run is a single side-effect-free function, `run_instance(spec)` in
   `cga/instance.py`. With `workers > 1`, the runs of an experiment execute on a pool of separate
   OS processes (`ProcessPoolExecutor`, spawn start method). They are processes, not threads: the
@@ -300,6 +344,8 @@ budget, and it is defined whenever more than half of the runs finished.
 cga/
   simulator.py      the cGA loop: run_cga(n, K, L, comparator, max_iterations, rng, log_checkpoints)
   instance.py       one run as a unit of work: InstanceSpec, run_instance() (what worker processes run)
+  kernel/           the C++ engine (cga_kernel.cpp) and its ctypes binding; compiled automatically
+  live.py           live runs: background runner, constant-size memory-mapped store, stop/resume
   comparators.py    BinVal comparator and the registry for other fitness functions
   experiments.py    config parsing, run_instance(), trajectory / sweep / scaling drivers (resumable)
   plotting.py       all figures

@@ -281,6 +281,78 @@ def test_interrupt_terminates_workers():
     assert any("in progress" in m for m in seen)
 
 
+def test_cpp_engine_bitwise_identical():
+    import math
+    import warnings
+    from cga import kernel
+    from cga.comparators import make_comparator
+    if not kernel.available():
+        print("  (skipped: C++ kernel unavailable)")
+        return
+    fitnesses = {"binval": binval_comparator}
+    try:
+        fitnesses["onemax"] = make_comparator("onemax", 1, np.random.default_rng(0))
+    except NotImplementedError:
+        pass
+    cases = [(10, 5, 1.0, 100_000), (30, 17, 1.0, 100_000), (60, 3, 2.0, 200_000), (100, 1e9, 1.0, 3000),
+             (7, 1.0, 1.0, 10_000), (1, 2.0, 1.0, 100), (3, 0.7, 1.0, 1000), (200, 8 * math.log(200), 2.0, 100_000)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for (n, K, L, budget), seed, (name, comp) in itertools.product(cases, range(3), fitnesses.items()):
+            r1, r2 = np.random.default_rng(seed), np.random.default_rng(seed)
+            a = run_cga(n, K, L, comp, budget, r1, log_checkpoints=True)
+            b = kernel.run_cga_cpp(n, K, L, name, budget, r2, log_checkpoints=True)
+            assert (a.converged, a.runtime, a.iterations) == (b.converged, b.runtime, b.iterations), (name, n, K, seed)
+            np.testing.assert_array_equal(a.checkpoint_times, b.checkpoint_times)
+            np.testing.assert_array_equal(a.checkpoint_p, b.checkpoint_p)
+            assert r1.bit_generator.state == r2.bit_generator.state
+
+
+def test_engine_selection_gives_identical_results():
+    from cga import kernel
+    spec = InstanceSpec(n=40, K=12.0, L=1.0, fitness="binval", max_iterations=200_000, seed=9, log_checkpoints=True)
+    old = os.environ.get("CGA_ENGINE")
+    try:
+        os.environ["CGA_ENGINE"] = "python"
+        assert kernel.engine_for("binval") == "python"
+        a = run_instance(spec)
+        os.environ["CGA_ENGINE"] = "auto"
+        b = run_instance(spec)
+    finally:
+        if old is None:
+            os.environ.pop("CGA_ENGINE", None)
+        else:
+            os.environ["CGA_ENGINE"] = old
+    assert a.runtime == b.runtime
+    np.testing.assert_array_equal(a.checkpoint_p, b.checkpoint_p)
+
+
+def test_live_run_end_to_end():
+    import math
+    import shutil
+    import time
+    from cga import kernel, live
+    if not kernel.available():
+        print("  (skipped: C++ kernel unavailable)")
+        return
+    n, L, seed = 300, 2.0, 11
+    expected = run_instance(InstanceSpec(n, 8 * math.log(n), L, "binval", 10**9, seed)).runtime
+    d = live.start(n, "8*log(n)", L, "binval", seed, None, rows_per_second=20, label="unit test")
+    try:
+        deadline = time.time() + 60
+        while live.status_of(d) in ("starting", "running") and time.time() < deadline:
+            time.sleep(0.1)
+        assert live.status_of(d) == "optimum found", live.status_of(d)
+        snap = live.snapshot(d)
+        assert snap["runtime"] == expected
+        ht = snap["hist_t"]
+        assert ht[0] == 0 and (np.diff(ht[:-1]) == snap["hist_interval"]).all()  # evenly spaced, last = final
+        assert len(snap["log_t"]) > 50 and len(snap["recent_t"]) >= 1
+        assert snap["hist"].dtype == np.uint8 and snap["hist"].shape[1] == n
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

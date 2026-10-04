@@ -21,11 +21,16 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import numpy as np
 import yaml
 
 from cga.experiments import (ScalingConfig, SweepConfig, TrajectoryConfig, default_track_indices, default_workers,
                              geometric_ns, parse_experiment, run_experiment)
 from cga.expressions import eval_expr
+from cga import kernel as cga_kernel
+from cga import live as live_runs
+from cga.comparators import make_comparator
+from cga.plotting import FREQ_CMAP
 from cga.simulator import borders
 
 HERE = Path(__file__).resolve().parent
@@ -464,6 +469,7 @@ def page_about() -> None:
         "- **Trajectory** — one setting (n, K, L), watched over time: how do the frequencies evolve?\n"
         "- **Sweep** — runtime as a function of K, for one or more n.\n"
         "- **Scaling** — runtime as a function of n, with K given as a formula in n; fits T ≈ c·nᵇ.\n"
+        "- **Live** — one long run in the background, watched while it runs: the frequencies as rows of colours.\n"
         "- **Load from file** — upload an experiment file (YAML) with any number of experiments and run them.\n"
         "- **Browse results** — reopen the plots and tables of any experiment run before (from here or the terminal)."
     )
@@ -869,6 +875,240 @@ def page_load() -> None:
                 show_run(run)
 
 
+# --------------------------------------------------------------------------- #
+# Live runs
+# --------------------------------------------------------------------------- #
+
+LIVE_DEFAULTS = {"lv_label": "", "lv_fitness": "binval", "lv_n": 200, "lv_K": "5*log(n)", "lv_L": 1.0, "lv_seed": 1,
+                 "lv_budget": 0, "lv_rows": 20, "lv_refresh": "1 s", "lv_view": "Whole run (even in time)"}
+_LUT = (FREQ_CMAP(np.linspace(0, 1, 256))[:, :3] * 255).round().astype(np.uint8)  # byte -> colour
+
+
+def _rows_image(rows: np.ndarray, width: int = 1200, row_px: int = 1) -> np.ndarray:
+    """Byte rows (r, n) -> RGB image about `width` pixels wide (columns averaged or repeated)."""
+    r, n = rows.shape
+    if n > width:  # average blocks of columns
+        f = int(math.ceil(n / width))
+        pad = (-n) % f
+        if pad:
+            rows = np.concatenate([rows, rows[:, -1:].repeat(pad, axis=1)], axis=1)
+        rows = rows.reshape(r, -1, f).mean(axis=2).round().astype(np.uint8)
+    elif n < width:
+        rows = rows.repeat(max(1, width // n), axis=1)
+    img = _LUT[rows]
+    return img.repeat(row_px, axis=0) if row_px > 1 else img
+
+
+def _fmt_count(v: float) -> str:
+    for unit, div in (("T", 1e12), ("G", 1e9), ("M", 1e6), ("k", 1e3)):
+        if abs(v) >= div:
+            return f"{v / div:.2f}{unit}"
+    return f"{v:,.0f}"
+
+
+def _live_fitness_options() -> list[str]:
+    out = []
+    for f in cga_kernel.FITNESS_CODES:
+        try:
+            make_comparator(f, 2, np.random.default_rng(0))
+            out.append(f)
+        except NotImplementedError:
+            pass
+    return out
+
+
+def _history_figure(rows: np.ndarray, times: np.ndarray, title: str, log_axis: bool):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    ax.imshow(_LUT[rows], aspect="auto", interpolation="nearest",
+              extent=(0.5, rows.shape[1] + 0.5, len(rows) - 0.5, -0.5))
+    k = min(8, len(times))
+    idx = np.unique(np.linspace(0, len(times) - 1, k).round().astype(int))
+    ax.set_yticks(idx)
+    ax.set_yticklabels([_fmt_count(times[i]) for i in idx])
+    ax.set_ylabel("iteration t" + (" (log scale)" if log_axis else ""))
+    ax.set_xlabel("bit i (1 = most significant)")
+    ax.set_title(title, fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def page_live() -> None:
+    import matplotlib.pyplot as plt
+
+    for key, value in LIVE_DEFAULTS.items():
+        st.session_state.setdefault(key, value)
+        st.session_state[key] = st.session_state[key]
+    ss = st.session_state
+    st.title("Live — watch one run as it happens")
+    st.markdown(
+        "**What happens:** one cGA run is started in a **background process**, using the fast C++ engine "
+        "(results identical to the Python simulator). It keeps running when you close this tab or even the app, "
+        "until the optimum is found, the budget is used up, or you press Stop. Each frequency vector is drawn as a "
+        "**row of colours** — bit 1 on the left, bit n on the right; orange = p near 0, grey = ½, blue = p near 1 — "
+        "and time flows **downward**."
+    )
+    with st.expander("How this stays small even for runs of days"):
+        st.markdown(
+            "Nothing is stored per iteration (10¹¹ iterations would be terabytes). Instead the run keeps a fixed "
+            "amount of data, a few MB, however long it runs:\n"
+            "- **Now:** the current frequencies, refreshed a few times per second.\n"
+            "- **Cascade:** the most recent rows, one every *k* iterations; *k* adapts so that about the chosen "
+            "number of rows arrive per second.\n"
+            "- **Whole run:** at most ~2000 rows at evenly spaced times. When it is full, every other row is dropped "
+            "and the spacing doubles, so it always covers the run from t = 0 to now.\n"
+            "- **Log time:** rows at t = 1, 2, 3, …, then 8 per doubling of t, so the early phase stays visible.\n"
+            "- **Front:** how many leading bits are at the upper border, and how many bits are at each border.\n\n"
+            "The exact state (frequencies and random-number state) is saved every minute and on Stop, so a run can "
+            "be resumed and continues exactly as if it had never been interrupted."
+        )
+    if not cga_kernel.available():
+        st.error("The C++ engine could not be built, and live runs need it. Details: "
+                 + str(cga_kernel._load_error or ""))
+        return
+
+    runs = live_runs.list_runs()
+    with st.expander("▶ Start a new live run", expanded=not runs):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.text_input("Label (optional)", key="lv_label", placeholder="e.g. BinVal n=1280 K=5 ln n L=1")
+            st.selectbox("Fitness function", _live_fitness_options(), key="lv_fitness")
+            st.number_input("n — number of bits", key="lv_n", min_value=1, step=10)
+        with c2:
+            st.text_input("K — number or expression in n", key="lv_K", help="Step size is 1/K. log is the natural log.")
+            st.number_input("L — border factor", key="lv_L", min_value=0.01, step=0.05, format="%.3f",
+                            help="Borders l = 1/(L·n), u = 1 − l.")
+            st.number_input("Seed", key="lv_seed", step=1)
+        with c3:
+            st.number_input("Budget (iterations, 0 = until the optimum)", key="lv_budget", min_value=0, step=10**6,
+                            help="0 runs until the optimum is found or you press Stop.")
+            st.number_input("Cascade speed (rows per second)", key="lv_rows", min_value=1, max_value=200, step=5,
+                            help="How fast new rows arrive in the cascade. The run itself is not slowed down.")
+        try:
+            K_val = eval_expr(ss.lv_K, int(ss.lv_n))
+            lo, hi = borders(int(ss.lv_n), float(ss.lv_L))
+            st.caption(f"K = {K_val:.4g} · step 1/K = {1 / K_val:.4g} · borders l = {lo:.4g}, u = {hi:.4g} · uses one "
+                       f"CPU core while it runs")
+            form_error = None if K_val > 0 else "K must be positive."
+        except ValueError as exc:
+            form_error = str(exc)
+        if form_error:
+            st.error(form_error)
+        if st.button("▶ Start live run", type="primary", disabled=bool(form_error)):
+            try:
+                d = live_runs.start(int(ss.lv_n), ss.lv_K.strip(), float(ss.lv_L), ss.lv_fitness, int(ss.lv_seed),
+                                    int(ss.lv_budget) or None, float(ss.lv_rows), ss.lv_label)
+                ss.lv_selected = d.name
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not start: {exc}")
+
+    runs = live_runs.list_runs()
+    if not runs:
+        st.info("No live runs yet.")
+        return
+    by_id = {d.name: d for d in runs}
+    metas = {d.name: live_runs.read_meta(d) for d in runs}
+
+    def describe(run_id: str) -> str:
+        m = metas[run_id]
+        name = m.get("label") or run_id
+        return f"{name} — {m['fitness']}, n={m['n']}, K={m['K_expr']}, L={m['L']:g}"  # stable text (no status)
+
+    if ss.get("lv_selected") not in by_id:
+        ss.lv_selected = runs[0].name
+    c1, c2 = st.columns([4, 1])
+    run_id = c1.selectbox("Live run", list(by_id), key="lv_selected", format_func=describe)
+    c2.selectbox("Refresh every", ["1 s", "2 s", "5 s", "off"], key="lv_refresh")
+    d, meta = by_id[run_id], metas[run_id]
+
+    alive = live_runs.is_alive(d)
+    status = live_runs.status_of(d)
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 3])
+    if alive and b1.button("⏹ Stop", help="Stops after saving the exact state; Resume continues exactly."):
+        live_runs.stop(d)
+        st.rerun()
+    if not alive and status in ("stopped", "interrupted") and b1.button("▶ Resume"):
+        live_runs.resume(d)
+        st.rerun()
+    confirm = b3.checkbox("confirm delete", key=f"lv_del_{run_id}")
+    if b2.button("🗑 Delete", disabled=not confirm):
+        live_runs.delete(d)
+        ss.pop("lv_selected", None)
+        st.rerun()
+    if status == "interrupted":
+        b4.warning("The runner stopped without finishing (app or computer restart?). Resume continues from the "
+                   "last saved state, at most a minute back.")
+
+    refresh = {"1 s": 1.0, "2 s": 2.0, "5 s": 5.0, "off": None}[ss.lv_refresh]
+
+    @st.fragment(run_every=refresh)
+    def viewer() -> None:
+        try:
+            snap = live_runs.snapshot(d)
+        except (FileNotFoundError, ValueError):
+            st.info("Starting…")
+            return
+        cur_status = live_runs.status_of(d)
+        n = int(meta["n"])
+        budget = meta.get("max_iterations")
+        line = [f"**{cur_status}**", f"t = **{snap['t']:,}** iterations"]
+        if snap["rate"] > 0 and cur_status in ("running", "starting"):
+            line.append(f"{_fmt_count(snap['rate'])} iterations/s")
+        line.append(f"running for {fmt_duration(snap['elapsed'])}")
+        if snap["runtime"] > 0:
+            line.append(f"optimum sampled at **T = {snap['runtime']:,}**")
+        if budget:
+            line.append(f"{100 * snap['t'] / budget:.1f}% of the budget {budget:,}")
+        st.markdown(" · ".join(line))
+        if len(snap["recent_m"]):
+            front, upper, lower, mean = snap["recent_m"][0]
+            m = st.columns(4)
+            m[0].metric("Front", f"{int(front)} / {n}", help="Leading bits (from bit 1) at the upper border u.")
+            m[1].metric("Bits at upper border", f"{int(upper)}")
+            m[2].metric("Bits at lower border", f"{int(lower)}")
+            m[3].metric("Mean frequency", f"{mean:.3f}")
+
+        st.markdown(f"**Cascade** — newest row at the bottom, one row every {snap['k']:,} iterations")
+        recent = snap["recent"][::-1]  # oldest first, newest last (time flows downward)
+        if len(recent):
+            st.image(_rows_image(recent), width="stretch")
+            rt = snap["recent_t"][::-1]
+            st.caption(f"from t = {rt[0]:,} (top) to t = {rt[-1]:,} (bottom)")
+        st.markdown("**Now**")
+        st.image(_rows_image(snap["current"][None, :], row_px=28), width="stretch")
+        st.caption("← bit 1 (most significant)  ·  colour: orange = 0, grey = ½, blue = 1  ·  bit n →")
+
+        # A remembered selector rather than st.tabs: tabs would jump back to the first one on every refresh.
+        view = st.segmented_control("History", ["Whole run (even in time)", "Whole run (log time)",
+                                                "Front and borders over time"], key="lv_view")
+        if view == "Whole run (even in time)":
+            if len(snap["hist"]) > 1:
+                fig = _history_figure(snap["hist"], snap["hist_t"],
+                                      f"t = 0 … {snap['hist_t'][-1]:,}, one row every "
+                                      f"{snap['hist_interval']:,} iterations", False)
+                st.pyplot(fig, width="stretch")
+                plt.close(fig)
+        elif view == "Whole run (log time)":
+            if len(snap["log"]) > 1:
+                fig = _history_figure(snap["log"], snap["log_t"], "rows at t = 1, 2, 3, …, then 8 per doubling of t",
+                                      True)
+                st.pyplot(fig, width="stretch")
+                plt.close(fig)
+        elif view == "Front and borders over time":
+            hm = snap["hist_m"]
+            if len(hm) > 1:
+                df = pd.DataFrame({"t": snap["hist_t"], "front / n": hm[:, 0] / n,
+                                   "bits at upper border / n": hm[:, 1] / n,
+                                   "bits at lower border / n": hm[:, 2] / n, "mean frequency": hm[:, 3]})
+                st.line_chart(df, x="t", y=["front / n", "bits at upper border / n", "bits at lower border / n",
+                                            "mean frequency"])
+                st.caption("The front is the number of leading bits (from bit 1) at the upper border u.")
+
+    viewer()
+
+
 def page_browse() -> None:
     st.title("Browse results")
     dirs = sorted((d for d in RESULTS.glob("*") if d.is_dir() and not d.name.startswith(".")),
@@ -901,6 +1141,7 @@ PAGES = {
     "Sweep": (page_sweep, "runtime vs K, for one or more n"),
     "Scaling": (page_scaling, "runtime vs n, K as a formula in n"),
     "Load from file": (page_load, "upload a YAML experiment file"),
+    "Live": (page_live, "watch one long run as it happens"),
     "Browse results": (page_browse, "reopen saved experiments"),
 }
 

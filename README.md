@@ -4,7 +4,11 @@
 Genetic Algorithm (cGA) on the static BinVal function.** Written for a bachelor thesis on the
 runtime analysis of evolutionary algorithms at ETH Zürich.
 
-![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue) ![numpy](https://img.shields.io/badge/numpy-vectorized-informational) ![Streamlit](https://img.shields.io/badge/UI-Streamlit-ff4b4b)
+Experiments (frequency trajectories, runtime vs K, runtime vs n) run on a C++ engine that gives
+bit-for-bit the same results as the reference Python implementation, 5–50× faster. Long runs can be
+watched live while they run, for hours or days, in constant memory.
+
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue) ![C++ engine](https://img.shields.io/badge/engine-C%2B%2B-00599c) ![numpy](https://img.shields.io/badge/numpy-vectorized-informational) ![Streamlit](https://img.shields.io/badge/UI-Streamlit-ff4b4b)
 
 <p align="center">
   <img src="docs/images/ui_results_trajectory.png" width="900" alt="The app showing the results of a trajectory experiment">
@@ -17,6 +21,7 @@ runtime analysis of evolutionary algorithms at ETH Zürich.
 [Context](#context) ·
 [The algorithm](#the-algorithm) ·
 [What the simulator measures](#what-the-simulator-measures) ·
+[Live runs](#4-live-watch-one-long-run-as-it-happens) ·
 [The app](#the-app) ·
 [Quick start](#quick-start) ·
 [Command line and experiment files](#command-line-and-experiment-files) ·
@@ -178,6 +183,10 @@ input has a help tooltip.
 | ![Scaling results](docs/images/ui_results_scaling.png) | ![Load from file](docs/images/ui_load.png) |
 | **Scaling results.** A table of the fitted exponents, then the log-log plot, the normalized plot and the summary table. | **Load from file.** Upload a YAML experiment file (a commented template is included) or use `experiments.yaml`. Every entry is validated and summarized, and you choose which ones to run. |
 
+**Live** (described [above](#4-live-watch-one-long-run-as-it-happens)) starts a single long run in the
+background and shows it while it runs, with Stop, Resume and Delete buttons. Several live runs can
+exist side by side; each one uses one CPU core while it runs.
+
 **Parallel workers.** Every experiment form has a *Parallel workers* field next to *Repetitions*.
 It sets how many separate OS processes run the repetitions at the same time; the default is all
 CPUs but one. Opening a second browser tab of the app does **not** add parallelism, because both
@@ -212,13 +221,15 @@ python3 -m pip install -r requirements.txt   # numpy, matplotlib, pandas, PyYAML
 streamlit run app.py                         # opens the app in the browser
 ```
 
-On macOS you can also double-click `start_ui.command`. A small experiment (n = 200, a few
-repetitions) finishes in seconds.
+On macOS you can also double-click `start_ui.command`. The C++ engine is compiled automatically the
+first time it is needed, which takes about a second. A small experiment (n = 200, a few repetitions)
+finishes in seconds.
 
-To check the implementation:
+To check the implementation (including that the C++ and Python engines agree bit for bit):
 
 ```bash
 python3 tests/test_simulator.py              # or: pytest tests/
+CGA_ENGINE=python python3 tests/test_simulator.py   # the same tests on the pure-Python engine
 ```
 
 ## Command line and experiment files
@@ -342,12 +353,12 @@ budget, and it is defined whenever more than half of the runs finished.
 
 ```
 cga/
-  simulator.py      the cGA loop: run_cga(n, K, L, comparator, max_iterations, rng, log_checkpoints)
+  simulator.py      the reference cGA loop in Python: run_cga(n, K, L, comparator, max_iterations, rng, ...)
   instance.py       one run as a unit of work: InstanceSpec, run_instance() (what worker processes run)
   kernel/           the C++ engine (cga_kernel.cpp) and its ctypes binding; compiled automatically
   live.py           live runs: background runner, constant-size memory-mapped store, stop/resume
   comparators.py    BinVal comparator and the registry for other fitness functions
-  experiments.py    config parsing, run_instance(), trajectory / sweep / scaling drivers (resumable)
+  experiments.py    config parsing, trajectory / sweep / scaling drivers (resumable, parallel)
   plotting.py       all figures
   analysis.py       power-law fits T ~ c * n^b (budget-unbiased)
   expressions.py    evaluation of expressions such as "5*log(n)"
